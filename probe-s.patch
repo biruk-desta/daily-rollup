@@ -1,0 +1,802 @@
+diff --git a/large_memory.hpp b/large_memory.hpp
+index cc576d03b70ffe32fe4f45ab84ccddcefdb9db06..120b1eca1f1f58591860b08d194078a4d5d4bfcf 100644
+--- a/large_memory.hpp
++++ b/large_memory.hpp
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <cstddef>
++#include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
+ #include <memory>
+@@ -11,6 +13,7 @@
+ #include <vector>
+ 
+ #include <sys/mman.h>
++#include <unistd.h>
+ 
+ namespace memory {
+ 
+@@ -106,20 +109,137 @@ template<class T> struct Allocator {
+ 
+ template<class T> using Vector = std::vector<T, Allocator<T>>;
+ 
++class ScratchPool {
++    struct FreeBlock { size_t bytes; FreeBlock* next; };
++    static constexpr size_t alignment = alignof(std::max_align_t);
++    static constexpr size_t quantum = std::max(alignment, sizeof(FreeBlock));
++    std::vector<Region> mappings_;
++    FreeBlock* free_ = nullptr;
++    std::mutex mutex_;
++
++    static uintptr_t address(const void* ptr) { return reinterpret_cast<uintptr_t>(ptr); }
++    static size_t rounded(size_t bytes) { return (bytes + quantum - 1) / quantum * quantum; }
++
++public:
++    ~ScratchPool() {
++        for (const auto& region : mappings_) {
++            forget(region.address);
++            munmap(region.address, region.bytes);
++        }
++    }
++
++    void adopt(std::vector<Region> mappings) {
++        mappings_ = std::move(mappings);
++        std::sort(mappings_.begin(), mappings_.end(), [](const auto& a, const auto& b) {
++            return address(a.address) < address(b.address);
++        });
++        long page = sysconf(_SC_PAGESIZE);
++        if (page <= 0) return;
++#ifdef __APPLE__
++        std::vector<char> resident;
++#else
++        std::vector<unsigned char> resident;
++#endif
++        for (auto it = mappings_.rbegin(); it != mappings_.rend(); ++it) {
++            auto* start = static_cast<std::byte*>(it->address);
++            resident.resize(it->bytes / page);
++            if (mincore(start, it->bytes, resident.data()) != 0) continue;
++            for (size_t end = resident.size(); end;) {
++                while (end && !(resident[end - 1] & 1)) --end;
++                size_t begin = end;
++                while (begin && (resident[begin - 1] & 1)) --begin;
++                if (begin != end) free_ = ::new (start + begin * page) FreeBlock{(end - begin) * page, free_};
++                end = begin;
++            }
++        }
++    }
++
++    void* allocate(size_t bytes, size_t align) {
++        if (!bytes || align > alignment || bytes > size_t(-1) - quantum) return nullptr;
++        bytes = rounded(bytes);
++        std::lock_guard lock(mutex_);
++        auto** link = &free_;
++        while (*link && (*link)->bytes < bytes) link = &(*link)->next;
++        auto* block = *link;
++        if (!block) return nullptr;
++        auto* next = block->next;
++        if (block->bytes > bytes)
++            next = ::new (reinterpret_cast<std::byte*>(block) + bytes) FreeBlock{block->bytes - bytes, next};
++        *link = next;
++        return block;
++    }
++
++    bool reclaim(void* ptr, size_t bytes) {
++        uintptr_t start = address(ptr);
++        auto owner = std::upper_bound(mappings_.begin(), mappings_.end(), start,
++            [](uintptr_t at, const Region& region) { return at < address(region.address); });
++        if (owner == mappings_.begin()) return false;
++        --owner;
++        if (start - address(owner->address) >= owner->bytes) return false;
++        bytes = rounded(bytes);
++        std::lock_guard lock(mutex_);
++        auto** link = &free_;
++        FreeBlock* previous = nullptr;
++        while (*link && address(*link) < start) {
++            previous = *link;
++            link = &previous->next;
++        }
++        auto* next = *link;
++        if (next && start + bytes == address(next)) {
++            bytes += next->bytes;
++            next = next->next;
++        }
++        if (previous && address(previous) + previous->bytes == start) {
++            previous->bytes += bytes;
++            previous->next = next;
++        } else {
++            *link = ::new (ptr) FreeBlock{bytes, next};
++        }
++        return true;
++    }
++};
++
++template<class T, template<class> class Base = Allocator> struct ScratchAllocator {
++    using value_type = T;
++    using propagate_on_container_move_assignment = std::true_type;
++    using propagate_on_container_swap = std::true_type;
++    template<class U> struct rebind { using other = ScratchAllocator<U, Base>; };
++    ScratchPool* pool = nullptr;
++
++    ScratchAllocator() = default;
++    explicit ScratchAllocator(ScratchPool* pool) : pool(pool) {}
++    template<class U> ScratchAllocator(const ScratchAllocator<U, Base>& other) : pool(other.pool) {}
++    bool operator==(const ScratchAllocator&) const = default;
++
++    T* allocate(size_t count) {
++        if (count > size_t(-1) / sizeof(T)) throw std::bad_array_new_length();
++        if (pool) if (void* ptr = pool->allocate(count * sizeof(T), alignof(T))) return static_cast<T*>(ptr);
++        return Base<T>{}.allocate(count);
++    }
++
++    void deallocate(T* data, size_t count) {
++        if (!pool || !pool->reclaim(data, count * sizeof(T))) Base<T>{}.deallocate(data, count);
++    }
++};
++
++template<class T, template<class> class Base = Allocator>
++using ScratchVector = std::vector<T, ScratchAllocator<T, Base>>;
++
+ template<class K, class V, class Hash = std::hash<K>>
+ using Map = std::unordered_map<K, V, Hash, std::equal_to<K>, Allocator<std::pair<const K, V>>>;
+ 
+-template<class T> struct ArrayDeleter {
++template<class T, class Alloc = Allocator<T>> struct ArrayDeleter {
+     size_t count = 0;
+-    void operator()(T* data) const { Allocator<T>{}.deallocate(data, count); }
++    [[no_unique_address]] Alloc allocator;
++    void operator()(T* data) { allocator.deallocate(data, count); }
+ };
+ 
+-template<class T> using Array = std::unique_ptr<T[], ArrayDeleter<T>>;
++template<class T, class Alloc = Allocator<T>> using Array = std::unique_ptr<T[], ArrayDeleter<T, Alloc>>;
+ 
+-template<class T> Array<T> array(size_t count) {
++template<class T, class Alloc = Allocator<T>> Array<T, Alloc> array(size_t count, Alloc allocator = {}) {
+     static_assert(std::is_trivially_default_constructible_v<T> && std::is_trivially_destructible_v<T>);
+-    auto* data = Allocator<T>{}.allocate(count);
+-    return Array<T>(::new (data) T[count], ArrayDeleter<T>{count});
++    auto* data = allocator.allocate(count);
++    return Array<T, Alloc>(::new (data) T[count], {count, allocator});
+ }
+ 
+ template<class T> class HugeArray {
+diff --git a/main.cpp b/main.cpp
+index 98bfd92e2b0a31361267de17a3f0cabe1e50c2ab..cf674c19661c24969cfb43e496941269e29b8e77 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -1421,6 +1421,28 @@ bool click_id_after(const char* a, const char* b) {
+     }
+ }
+ 
++template<bool Fast> bool session_click_id_after(const char* a, const char* b) {
++    if constexpr (Fast) {
++        if (a[1] != ',' && a[1] != '"' && b[1] != ',' && b[1] != '"') {
++            uint64_t left, right;
++            std::memcpy(&left, a, sizeof(left));
++            std::memcpy(&right, b, sizeof(right));
++            auto has_byte = [](uint64_t word, uint8_t byte) {
++                word ^= uint64_t(byte) * 0x0101010101010101ULL;
++                return (word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL;
++            };
++            if (!has_byte(left, ',') && !has_byte(right, ',') &&
++                !has_byte(left, '"') && !has_byte(right, '"')) {
++                if (left == right) return click_id_after(a + sizeof(left), b + sizeof(right));
++                if constexpr (std::endian::native == std::endian::little)
++                    return __builtin_bswap64(left) > __builtin_bswap64(right);
++                else return left > right;
++            }
++        }
++    }
++    return click_id_after(a, b);
++}
++
+ constexpr uint32_t price_mask = (1u << 24) - 1;
+ 
+ bool compact_events(const Window& window, const Catalogs& catalogs) {
+@@ -1516,8 +1538,8 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+                  const Window& window, const Catalogs& catalogs, const Input& links, Ids& ids,
+                  People& people, ScatterWorkers<Candidate>& entries, size_t buckets, size_t ingest_buckets,
+                  ScatterWorkers<typename Candidate::Survivor>& records, size_t partitions, size_t alias_batch,
+-                 int alias_load, bool alias_bitmap, const ScatterSettings& scatter,
+-                 size_t click_tasks, ClickWork scan_clicks, ClickFinish finish_clicks) {
++                 int alias_load, bool alias_bitmap, unsigned dedup_load, const ScatterSettings& scatter,
++                 memory::ScratchPool* scratch_pool, size_t click_tasks, ClickWork scan_clicks, ClickFinish finish_clicks) {
+     std::optional<Ids> event_ids(std::in_place, 'e');
+     std::array<int64_t, 8> chunk_ends{};
+     LinkTrace link_trace;
+@@ -1619,8 +1641,14 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         };
+         constexpr size_t budget = 512 << 10;
+         constexpr size_t bytes_per_winner = std::bit_ceil(sizeof(Candidate)) + sizeof(const Candidate*);
+-        if (count > budget / bytes_per_winner ||
+-            std::bit_ceil(count + count / 2 + 1) * sizeof(uint32_t) > budget - count * bytes_per_winner) {
++        size_t slots = 0;
++        if (count <= budget / bytes_per_winner) {
++            size_t target = count + count / 2 + 1;
++            if (dedup_load == 50) target = count * 2;
++            if (dedup_load == 75) target = count + (count + 2) / 3;
++            slots = std::bit_ceil(target);
++        }
++        if (!slots || slots * sizeof(uint32_t) > budget - count * bytes_per_winner) {
+             auto order = [](const Candidate& a, const Candidate& b) {
+                 return a.id == b.id ? a.ingest < b.ingest : a.id < b.id;
+             };
+@@ -1643,7 +1671,6 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         auto& table = tables[worker];
+         table.winners.clear();
+         table.winners.reserve(count);
+-        size_t slots = std::bit_ceil(count + count / 2 + 1);
+         auto& positions = table.positions;
+         positions.assign(slots, 0);
+         size_t mask = slots - 1;
+@@ -1699,9 +1726,10 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+     }, [&](unsigned worker) { records[worker]->finish(); });
+     trace.mark("event_dedup_route");
+     std::vector<memory::Region> retired;
+-    if (memory::settings().release != memory::Release::None)
+-        for (auto& entry : entries) entry->take_mappings(retired);
+-    release_parallel(retired, threads);
++    if (scratch_pool || memory::settings().release != memory::Release::None)
++        for (auto& entry : entries) entry->take_mappings(retired, !scratch_pool);
++    if (scratch_pool) scratch_pool->adopt(std::move(retired));
++    else release_parallel(retired, threads);
+     entries.clear();
+     trace.mark("candidate_release");
+ }
+@@ -1723,14 +1751,14 @@ void scan_click_chunk(View chunk, Scatter<Click<Time>>& records, size_t partitio
+ }
+ 
+ template<class T> class ScratchArray {
+-    memory::Array<T> data_;
+-    size_t capacity_ = 0;
++    memory::Array<T, memory::ScratchAllocator<T>> data_;
+ public:
++    explicit ScratchArray(memory::ScratchPool* pool = nullptr)
++        : data_(nullptr, {0, memory::ScratchAllocator<T>(pool)}) {}
++
+     T* resize(size_t count) {
+-        if (count > capacity_) {
+-            capacity_ = std::bit_ceil(count);
+-            data_ = memory::array<T>(capacity_);
+-        }
++        if (count > data_.get_deleter().count)
++            data_ = memory::array<T>(std::bit_ceil(count), data_.get_deleter().allocator);
+         return data_.get();
+     }
+     T* get() const { return data_.get(); }
+@@ -1740,65 +1768,100 @@ struct PersonTableFull {};
+ 
+ template<class Value, class Time, class Index> struct Timelines {
+     using Category = decltype(unpack(std::declval<Value>(), std::declval<const Window&>()).category);
++    using Purchase = SessionPurchase<Category>;
+     struct PersonRange { Person person; Index begin, end, click_begin, click_end; };
+     struct Slot { Person person; Index index, count; };
+-    std::vector<PersonRange> people;
++    std::span<PersonRange> people;
++    memory::ScratchVector<PersonRange, std::allocator> person_vector;
++    ScratchArray<PersonRange> person_storage;
+     ScratchArray<Value> values, staged;
+     ScratchArray<ClickValue<Time>> clicks;
+     ScratchArray<Index> local_ids, click_ids;
+     ScratchArray<uint64_t> keys, by_bucket;
+-    memory::Vector<SessionPurchase<Category>> purchases;
+-    std::vector<Index> bucket_offsets;
+-    std::vector<Index> event_offsets;
+-    memory::Vector<Slot> table;
++    std::span<Purchase> purchases;
++    memory::ScratchVector<Purchase> purchase_vector;
++    ScratchArray<Purchase> purchase_storage;
++    memory::ScratchVector<Index, std::allocator> bucket_offsets, event_offsets;
++    memory::ScratchVector<Slot> table;
++
++    explicit Timelines(memory::ScratchPool* pool)
++        : person_vector(memory::ScratchAllocator<PersonRange, std::allocator>(pool)),
++          person_storage(pool), values(pool), staged(pool), clicks(pool), local_ids(pool), click_ids(pool),
++          keys(pool), by_bucket(pool), purchase_vector(memory::ScratchAllocator<Purchase>(pool)),
++          purchase_storage(pool), bucket_offsets(memory::ScratchAllocator<Index, std::allocator>(pool)),
++          event_offsets(bucket_offsets.get_allocator()), table(memory::ScratchAllocator<Slot>(pool)) {}
+ };
+ 
+-template<bool Bucketed, class Value, class Time, class Index>
++template<bool Bucketed, bool Fast, class Value, class Time, class Index>
+ void collect_timelines(Timelines<Value, Time, Index>& result,
+                        const ScatterWorkers<PersonEvent<Value>>& sources,
+                        const ScatterWorkers<Click<Time>>& click_sources,
+                        size_t bucket, size_t total, size_t click_count, unsigned partition_bits,
+                        const Window& window, const BucketLayout& layout, size_t few_clicks,
+-                       bool larger_person_table) {
+-    auto& people = result.people;
++                       bool larger_person_table, bool person_double_hash) {
++    using PersonRange = typename Timelines<Value, Time, Index>::PersonRange;
++    using Purchase = typename Timelines<Value, Time, Index>::Purchase;
++    auto& people = result.person_vector;
+     auto& table = result.table;
+     auto& offsets = result.event_offsets;
+     people.clear();
+     offsets.clear();
+     using Slot = typename Timelines<Value, Time, Index>::Slot;
+     size_t max_people = Bucketed ? std::min(total, layout.person_limit()) : 768;
+-    size_t max_slots = std::max<size_t>(32, std::bit_ceil((max_people * 4 + 2) / 3));
+-    size_t estimate = larger_person_table ? total / 8 : total / 16;
++    bool low_load = Fast && larger_person_table;
++    size_t max_slots = std::max<size_t>(32, std::bit_ceil(low_load ? max_people * 2 : (max_people * 4 + 2) / 3));
++    size_t estimate = total / (larger_person_table ? (Fast ? 4 : 8) : 16);
+     size_t table_size = std::clamp<size_t>(std::bit_ceil(estimate + 1), 32, max_slots);
+     table.assign(table_size, Slot{});
+-    auto find = [partition_bits](auto& slots, Person person) -> Slot& {
+-        size_t mask = slots.size() - 1;
++    auto* slots = table.data();
++    size_t mask = table_size - 1;
++    auto find = [partition_bits, person_double_hash](Slot* slots, size_t mask, Person person) -> Slot& {
+         size_t i = (person >> partition_bits) & mask;
+-        while (slots[i].person && slots[i].person != person) i = (i + 1) & mask;
++        Person key = slots[i].person;
++        if (key && key != person) {
++            size_t step = person_double_hash ? size_t(person >> 32) | 1 : 1;
++            do {
++                i = (i + step) & mask;
++                key = slots[i].person;
++            } while (key && key != person);
++        }
+         return slots[i];
+     };
++    auto* person_storage = Fast ? result.person_storage.resize(max_people) : nullptr;
++    size_t person_count = 0;
++    size_t grow_at = low_load ? table_size / 2 : table_size * 3 / 4;
+     auto add = [&](Person person) -> Slot& {
+-        auto* slot = &find(table, person);
++        auto* slot = &find(slots, mask, person);
+         if (slot->person) return *slot;
+-        if (people.size() == max_people) throw PersonTableFull{};
+-        if (people.size() == table.size() * 3 / 4) {
+-            memory::Vector<Slot> grown(table.size() * 2);
+-            for (auto entry : table) if (entry.person) find(grown, entry.person) = entry;
++        if (person_count == max_people) throw PersonTableFull{};
++        if (person_count == grow_at) {
++            memory::ScratchVector<Slot> grown(table.size() * 2, table.get_allocator());
++            for (auto entry : table) if (entry.person) find(grown.data(), grown.size() - 1, entry.person) = entry;
+             table.swap(grown);
+-            slot = &find(table, person);
++            slots = table.data();
++            mask = table.size() - 1;
++            grow_at *= 2;
++            slot = &find(slots, mask, person);
+         }
+-        *slot = {person, static_cast<Index>(people.size()), 0};
+-        people.push_back({person, 0, 0, 0, 0});
++        *slot = {person, static_cast<Index>(person_count), 0};
++        PersonRange range{person, 0, 0, 0, 0};
++        if constexpr (Fast) person_storage[person_count] = range;
++        else people.push_back(range);
++        ++person_count;
+         return *slot;
+     };
+ 
+     auto* local_ids = Bucketed ? nullptr : result.local_ids.resize(total);
+     auto* staged = Bucketed ? nullptr : result.staged.resize(total);
+     auto* keys = Bucketed ? result.keys.resize(total) : nullptr;
++    Purchase* purchase_storage = nullptr;
++    size_t purchase_count = 0;
+     if constexpr (Bucketed) {
+         result.bucket_offsets.assign(layout.count, 0);
+-        result.purchases.clear();
++        if constexpr (Fast) purchase_storage = result.purchase_storage.resize(total);
++        else result.purchase_vector.clear();
+     }
++    auto* bucket_offsets = result.bucket_offsets.data();
+     size_t row_index = 0;
+     for (const auto& batch : sources) batch->visit(bucket, [&](const auto& row) {
+         auto& slot = add(row.person);
+@@ -1809,29 +1872,34 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+             if constexpr (std::is_same_v<Value, uint64_t>) time = row.value >> 32;
+             else time = uint64_t(event.time) - uint64_t(window.start);
+             uint32_t time_bucket = time / gap_ms;
+-            ++result.bucket_offsets[time_bucket];
++            ++bucket_offsets[time_bucket];
+             keys[row_index++] = layout.key(slot.index, time_bucket, time);
+-            if (event.price) result.purchases.push_back({(uint64_t(slot.index) << 32) | time,
+-                                                        event.price, event.category});
++            if (event.price) {
++                Purchase purchase{(uint64_t(slot.index) << 32) | time, event.price, event.category};
++                if constexpr (Fast) purchase_storage[purchase_count++] = purchase;
++                else result.purchase_vector.push_back(purchase);
++            }
+         } else {
+             staged[row_index] = row.value;
+             local_ids[row_index++] = slot.index;
+         }
+     });
+-    offsets.resize(people.size());
++    auto ranges = std::span(Fast ? person_storage : people.data(), person_count);
++    result.people = ranges;
++    offsets.resize(person_count);
+     for (auto slot : table) if (slot.person) offsets[slot.index] = slot.count;
+     auto* click_ids = result.click_ids.resize(click_count);
+     constexpr Index absent = std::numeric_limits<Index>::max();
+     row_index = 0;
+     for (const auto& batch : click_sources) batch->visit(bucket, [&](const auto& row) {
+-        auto& slot = find(table, row.person);
++        auto& slot = find(slots, mask, row.person);
+         click_ids[row_index++] = slot.person ? slot.index : absent;
+-        if (slot.person) ++people[slot.index].click_end;
++        if (slot.person) ++ranges[slot.index].click_end;
+     });
+ 
+     size_t next = 0, next_click = 0;
+-    for (size_t i = 0; i < people.size(); ++i) {
+-        auto& range = people[i];
++    for (size_t i = 0; i < person_count; ++i) {
++        auto& range = ranges[i];
+         range.begin = next;
+         next += offsets[i];
+         range.end = next;
+@@ -1841,25 +1909,28 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+         range.click_end = range.click_begin;
+     }
+     if constexpr (Bucketed) {
+-        bucket_scatter(layout, keys, result.by_bucket.resize(total), total, result.bucket_offsets, offsets);
++        bucket_scatter(layout, keys, result.by_bucket.resize(total), total,
++                       std::span(result.bucket_offsets), std::span(offsets));
++        if constexpr (Fast) result.purchases = std::span(purchase_storage, purchase_count);
++        else result.purchases = result.purchase_vector;
+         std::sort(result.purchases.begin(), result.purchases.end(),
+                   [](const auto& a, const auto& b) { return a.key < b.key; });
+     } else {
+         auto* values = result.values.resize(total);
+         for (size_t i = 0; i < total; ++i) values[offsets[local_ids[i]]++] = staged[i];
+-        for (const auto& range : people) sort_timeline(values + range.begin, values + range.end);
++        for (const auto& range : ranges) sort_timeline(values + range.begin, values + range.end);
+     }
+     auto* clicks = result.clicks.resize(next_click);
+     row_index = 0;
+     for (const auto& batch : click_sources) batch->visit(bucket, [&](const auto& row) {
+         Index id = click_ids[row_index++];
+-        if (id != absent) clicks[people[id].click_end++] = row.value;
++        if (id != absent) clicks[ranges[id].click_end++] = row.value;
+     });
+-    for (const auto& range : people) {
++    for (const auto& range : ranges) {
+         if (range.click_end - range.click_begin > std::max<size_t>(1, few_clicks))
+             std::sort(clicks + range.click_begin, clicks + range.click_end,
+                       [](const auto& a, const auto& b) {
+-                          return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
++                          return a.time == b.time ? session_click_id_after<Fast>(a.id, b.id) : a.time < b.time;
+                       });
+     }
+ }
+@@ -1917,25 +1988,65 @@ public:
+     }
+ };
+ 
++template<bool Fast, class T> struct AttributionList {
++    memory::ScratchVector<T, std::allocator>& values;
++    size_t used = 0;
++
++    size_t size() const {
++        if constexpr (Fast) return used;
++        else return values.size();
++    }
++    void push_back(T value) {
++        if constexpr (Fast) values[used++] = value;
++        else values.push_back(value);
++    }
++    void pop_back() {
++        if constexpr (Fast) --used;
++        else values.pop_back();
++    }
++    void clear() {
++        if constexpr (Fast) used = 0;
++        else values.clear();
++    }
++    T& operator[](size_t i) { return values[i]; }
++    T& back() { return values[size() - 1]; }
++    auto begin() const { return values.begin(); }
++    auto end() const { return begin() + size(); }
++};
++
+ template<class Category> struct AttributionScratch {
+     static constexpr bool sparse_categories = std::is_same_v<Category, size_t>;
+-    std::conditional_t<sparse_categories, std::unordered_map<Category, int64_t>, std::vector<int64_t>> spend;
+-    std::vector<Category> bought;
+-    std::vector<size_t> counts;
+-    std::vector<uint32_t> positions, active;
+-
+-    explicit AttributionScratch(const Catalogs& catalogs)
+-        : counts(catalogs.campaigns.size()), positions(counts.size()) {
+-        if constexpr (!sparse_categories) spend.resize(catalogs.categories.size());
++    std::conditional_t<sparse_categories, std::unordered_map<Category, int64_t>,
++                       memory::ScratchVector<int64_t, std::allocator>> spend;
++    memory::ScratchVector<Category, std::allocator> bought;
++    memory::ScratchVector<size_t, std::allocator> counts;
++    memory::ScratchVector<uint32_t, std::allocator> positions, active;
++    bool fast;
++
++    AttributionScratch(const Catalogs& catalogs, bool fast, memory::ScratchPool* pool)
++        : bought(memory::ScratchAllocator<Category, std::allocator>(pool)),
++          counts(catalogs.campaigns.size(), memory::ScratchAllocator<size_t, std::allocator>(pool)),
++          positions(counts.size(), memory::ScratchAllocator<uint32_t, std::allocator>(pool)),
++          active(positions.get_allocator()), fast(fast) {
++        if constexpr (!sparse_categories)
++            spend = decltype(spend)(catalogs.categories.size(), memory::ScratchAllocator<int64_t, std::allocator>(pool));
++        if (fast) {
++            bought.resize(catalogs.categories.size());
++            active.resize(counts.size());
++        }
+     }
+ };
+ 
+-template<bool Few = false, class Sessions, class ClickCursor, class Category>
+-void aggregate_person(Person person, Sessions sessions, ClickCursor first, ClickCursor last,
+-                      const Catalogs& catalogs, const Window& window, CampaignTotals& totals,
+-                      UserOutput<Category>& users, AttributionScratch<Category>& scratch) {
++template<bool Few, bool Fast, class Sessions, class ClickCursor, class Category>
++void aggregate_person_impl(Person person, Sessions sessions, ClickCursor first, ClickCursor last,
++                           const Catalogs& catalogs, const Window& window, CampaignTotals& totals,
++                           UserOutput<Category>& users, AttributionScratch<Category>& scratch) {
+     constexpr bool sparse_categories = AttributionScratch<Category>::sparse_categories;
+-    auto& [spend, bought, counts, positions, active] = scratch;
++    auto& spend = scratch.spend;
++    auto* counts = scratch.counts.data();
++    auto* positions = scratch.positions.data();
++    AttributionList<Fast, Category> bought{scratch.bought};
++    AttributionList<Fast, uint32_t> active{scratch.active};
+     using Time = decltype(last.front().time);
+     SHOPPING_TIME(unsigned weight = timing::sample(64);)
+     uint32_t latest = 0;
+@@ -1967,7 +2078,8 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+                         active.push_back(row.campaign);
+                         counts[row.campaign] = 1;
+                     }
+-                    if (row.time > best_time || (row.time == best_time && (!best_id || click_id_after(best_id, row.id)))) {
++                    if (row.time > best_time ||
++                        (row.time == best_time && (!best_id || session_click_id_after<Fast>(best_id, row.id)))) {
+                         best_time = row.time;
+                         best_id = row.id;
+                         winner = row.campaign;
+@@ -2030,6 +2142,16 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+     active.clear();
+ }
+ 
++template<bool Few = false, class Sessions, class ClickCursor, class Category>
++void aggregate_person(Person person, Sessions sessions, ClickCursor first, ClickCursor last,
++                      const Catalogs& catalogs, const Window& window, CampaignTotals& totals,
++                      UserOutput<Category>& users, AttributionScratch<Category>& scratch) {
++    if (scratch.fast)
++        aggregate_person_impl<Few, true>(person, std::move(sessions), first, last, catalogs, window, totals, users, scratch);
++    else
++        aggregate_person_impl<Few, false>(person, std::move(sessions), first, last, catalogs, window, totals, users, scratch);
++}
++
+ template<bool Bucketed, class Value, class Time, class Index, class Category>
+ void aggregate(const Timelines<Value, Time, Index>& timelines, const Catalogs& catalogs,
+                const Window& window, CampaignTotals& totals, UserOutput<Category>& users,
+@@ -2069,8 +2191,9 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+     }
+     if (!votes) frequent = 0;
+     auto event_value_less = [](const auto& a, const auto& b) { return time_key(a) < time_key(b); };
+-    auto click_value_less = [](const auto& a, const auto& b) {
+-        return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
++    auto click_value_less = [fast = scratch.fast](const auto& a, const auto& b) {
++        if (a.time != b.time) return a.time < b.time;
++        return fast ? session_click_id_after<true>(a.id, b.id) : click_id_after(a.id, b.id);
+     };
+     auto event_less = [&](const auto& a, const auto& b) {
+         return a.person == b.person ? event_value_less(a.value, b.value) : a.person < b.person;
+@@ -2086,7 +2209,7 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+     if (frequent) frequent_events.emplace(span, event_value_less);
+     struct ClickRange { size_t count = 0, end = 0; };
+     memory::Map<Person, ClickRange> click_ranges;
+-    ScratchArray<ClickValue<Time>> direct_clicks;
++    ScratchArray<ClickValue<Time>> direct_clicks(scratch.active.get_allocator().pool);
+     auto direct = [&](const ClickRange& range) { return few_clicks && range.count <= few_clicks; };
+     {
+         GroupTrace::Scope measured{group_trace};
+@@ -2194,8 +2317,9 @@ template<class Category> class UserOutput {
+     }
+ 
+ public:
+-    UserOutput(const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows)
+-        : catalogs_(catalogs), ids_(ids), path_(std::move(path)), group_rows_(group_rows) {}
++    UserOutput(const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows, memory::ScratchPool* pool)
++        : catalogs_(catalogs), ids_(ids), path_(std::move(path)), group_rows_(group_rows),
++          columns_(parquet::pages<std::size(user_schema)>(pool)) {}
+ 
+     void append(const UserDaily<Category>& row) {
+         using parquet::little_endian;
+@@ -2223,7 +2347,8 @@ public:
+     }
+ };
+ 
+-void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs) {
++void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs,
++                     memory::ScratchPool* pool) {
+     SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+     using parquet::little_endian;
+     using parquet::plain;
+@@ -2234,7 +2359,7 @@ void write_campaigns(const fs::path& path, const CampaignTotals& totals, const C
+         std::max(longest_string(catalogs.campaigns), longest_string(catalogs.channels)));
+     for (size_t offset = 0; offset < rows.size(); offset += group_rows) {
+         auto group = std::span(rows).subspan(offset, std::min(group_rows, rows.size() - offset));
+-        std::array<parquet::Page, std::size(campaign_schema)> columns;
++        auto columns = parquet::pages<std::size(campaign_schema)>(pool);
+         for (auto [key, values] : group) {
+             uint32_t campaign = key;
+             plain(columns[0].values, catalogs.campaigns[campaign]);
+@@ -2283,6 +2408,9 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto alias_load = number_env("SHOPPING_ALIAS_LOAD", 50);
+     if (alias_load != 50 && alias_load != 75) throw std::runtime_error("invalid SHOPPING_ALIAS_LOAD");
+     bool alias_bitmap = setting("SHOPPING_ALIAS_BITMAP", false);
++    auto dedup_load = number_env("SHOPPING_DEDUP_LOAD", 50);
++    if (dedup_load != 50 && dedup_load != 67 && dedup_load != 75)
++        throw std::runtime_error("invalid SHOPPING_DEDUP_LOAD");
+     auto staging_lines = number_env("SHOPPING_STAGING_LINES", 1);
+     if (staging_lines != 1 && staging_lines != 2 && staging_lines != 4)
+         throw std::runtime_error("invalid SHOPPING_STAGING_LINES");
+@@ -2298,6 +2426,8 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+                             std::min<uint64_t>(max_staging_prefetch, number_env("SHOPPING_STAGING_PREFETCH", 0, 0)),
+                             staging_avx, setting("SHOPPING_STAGING_CURSOR", true)};
+     size_t ingest_buckets = setting("SHOPPING_EVENT_TWO_LEVEL", false) ? std::min<size_t>(64, buckets) : buckets;
++    std::optional<memory::ScratchPool> arena;
++    auto* scratch_pool = setting("SHOPPING_REUSE_ARENAS", false) ? &arena.emplace() : nullptr;
+     auto entries = scatter_workers<Candidate>(threads, ingest_buckets, scatter);
+     auto events = scatter_workers<Survivor>(threads, partitions, scatter);
+     using ClickTime = std::conditional_t<std::is_same_v<Candidate, CompactCandidate>, uint32_t, int64_t>;
+@@ -2329,7 +2459,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     bool click_ingest = setting("SHOPPING_CLICK_INGEST", true);
+     if (click_ingest) clicks = scatter_workers<Click<ClickTime>>(threads, partitions, scatter);
+     read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, ingest_buckets,
+-                events, partitions, alias_batch, alias_load, alias_bitmap, scatter,
++                events, partitions, alias_batch, alias_load, alias_bitmap, dedup_load, scatter, scratch_pool,
+                 click_ingest ? click_input.chunks.size() : 0, scan_clicks, finish_clicks);
+     if (trace.enabled()) std::fprintf(stderr, "partitions %zu %zu\n", buckets, partitions);
+     if (!click_ingest) {
+@@ -2347,7 +2477,9 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto layout = BucketLayout::for_span(uint64_t(window.end) - uint64_t(window.start));
+     size_t bucket_minimum = number_env("SHOPPING_BUCKET_MIN_EVENTS", 128);
+     size_t few_clicks = number_env("SHOPPING_FEW_CLICKS", 16, 0);
++    bool session_fast = setting("SHOPPING_SESSION_FAST", false);
+     bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", true);
++    bool person_double_hash = setting("SHOPPING_PERSON_DOUBLE_HASH", false);
+     bool bucket_sessions = layout.count && !setting("SHOPPING_FORCE_SORT", false);
+     auto partition_bits = std::countr_zero(partitions);
+     struct Worker {
+@@ -2357,15 +2489,16 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+         UserOutput<Category> users;
+         GroupTrace group;
+ 
+-        Worker(const Window& window, const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows)
+-            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs),
+-              users(catalogs, ids, std::move(path), group_rows) {}
++        Worker(const Window& window, const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows,
++               bool session_fast, memory::ScratchPool* pool)
++            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs, session_fast, pool),
++              timelines(pool), users(catalogs, ids, std::move(path), group_rows, pool) {}
+     };
+     std::vector<Worker> workers;
+     workers.reserve(threads);
+     for (unsigned i = 0; i < threads; ++i)
+         workers.emplace_back(window, catalogs, ids, out / "user_daily" / ("part-" + std::to_string(i) + ".parquet"),
+-                             user_group_rows);
++                             user_group_rows, session_fast, scratch_pool);
+     std::vector<size_t> jobs(partitions), event_counts(partitions), click_counts(partitions);
+     for (size_t bucket = 0; bucket < partitions; ++bucket) {
+         jobs[bucket] = bucket;
+@@ -2383,8 +2516,14 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+             {
+                 GroupTrace::Scope measured{group};
+                 SHOPPING_TIME(timing::Scope group(timing::Group);)
+-                collect_timelines<Bucketed>(state.timelines, events, clicks, bucket, count, click_count,
+-                                            partition_bits, window, layout, few_clicks, larger_person_table);
++                if (session_fast)
++                    collect_timelines<Bucketed, true>(state.timelines, events, clicks, bucket, count, click_count,
++                                                      partition_bits, window, layout, few_clicks, larger_person_table,
++                                                      person_double_hash);
++                else
++                    collect_timelines<Bucketed, false>(state.timelines, events, clicks, bucket, count, click_count,
++                                                       partition_bits, window, layout, few_clicks, larger_person_table,
++                                                       person_double_hash);
+             }
+             SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
+             aggregate<Bucketed>(state.timelines, catalogs, window, state.campaigns, state.users, state.attribution,
+@@ -2445,7 +2584,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+         }
+         auto& totals = workers.front().campaigns;
+         for (unsigned i = 1; i < threads; ++i) totals.merge(workers[i].campaigns);
+-        write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
++        write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs, scratch_pool);
+     });
+     trace.mark("finish");
+     SHOPPING_TIME(timing::report();)
+diff --git a/parquet.hpp b/parquet.hpp
+index f2e9a298a68ed185ca11b030f32d3a45a77693fa..5ce95415a9535ce849750a14b7157bc7fcadce36 100644
+--- a/parquet.hpp
++++ b/parquet.hpp
+@@ -4,6 +4,7 @@
+ #include "large_memory.hpp"
+ 
+ #include <algorithm>
++#include <array>
+ #include <bit>
+ #include <cerrno>
+ #include <cstdint>
+@@ -23,7 +24,7 @@
+ 
+ namespace parquet {
+ 
+-using Bytes = memory::Vector<uint8_t>;
++using Bytes = memory::ScratchVector<uint8_t>;
+ using View = std::string_view;
+ 
+ template<class T> void little_endian(Bytes& bytes, T value) {
+@@ -95,6 +96,15 @@ inline size_t row_group_limit(size_t longest_string) {
+ 
+ struct Page { Bytes values, present; };
+ 
++template<size_t Count> std::array<Page, Count> pages(memory::ScratchPool* pool) {
++    std::array<Page, Count> result;
++    if (pool) {
++        memory::ScratchAllocator<uint8_t> allocator(pool);
++        for (auto& page : result) page = {Bytes(allocator), Bytes(allocator)};
++    }
++    return result;
++}
++
+ class File {
+     static constexpr int plain_encoding = 0;
+     static constexpr int rle_encoding = 3;
+@@ -226,8 +236,8 @@ public:
+             int64_t start = offset_;
+             queue(std::move(header));
+             queue(std::move(levels));
+-            queue(std::exchange(column.present, {}));
+-            queue(std::exchange(column.values, {}));
++            queue(std::exchange(column.present, Bytes(column.present.get_allocator())));
++            queue(std::exchange(column.values, Bytes(column.values.get_allocator())));
+             group.columns.push_back({start, offset_ - start});
+             group.size += offset_ - start;
+         }
+diff --git a/scatter.hpp b/scatter.hpp
+index f4e166e169c6b75ed6648c469e58fee4f8e8199f..74d4f3f5485c73a9253014f4c399ad6d0877fca7 100644
+--- a/scatter.hpp
++++ b/scatter.hpp
+@@ -38,11 +38,11 @@ public:
+         }
+     }
+ 
+-    void take_mappings(std::vector<memory::Region>& regions) {
++    void take_mappings(std::vector<memory::Region>& regions, bool unregister) {
+         regions.reserve(regions.size() + slabs_.size());
+         for (void* base : slabs_) {
+             regions.push_back({base, slab_bytes});
+-            memory::forget(base);
++            if (unregister) memory::forget(base);
+         }
+         slabs_.clear();
+     }
+@@ -303,7 +303,9 @@ public:
+     }
+ 
+     size_t size(size_t index) const { return streams_[index].count; }
+-    void take_mappings(std::vector<memory::Region>& regions) { arena_.take_mappings(regions); }
++    void take_mappings(std::vector<memory::Region>& regions, bool unregister) {
++        arena_.take_mappings(regions, unregister);
++    }
+     const T* first(size_t index) const {
+         auto* block = streams_[index].head;
+         return block ? block->lines[0].rows : nullptr;
+diff --git a/session_buckets.hpp b/session_buckets.hpp
+index 3b507c3c6b204cdd506537b117930d560eddeeb8..5c3b672baab7f278628442f8307992fbbe5526e7 100644
+--- a/session_buckets.hpp
++++ b/session_buckets.hpp
+@@ -102,7 +102,7 @@ public:
+ 
+ template<class Index>
+ void bucket_scatter(const BucketLayout& layout, uint64_t* keys, uint64_t* scratch, size_t count,
+-                    std::vector<Index>& buckets, std::vector<Index>& people) {
++                    std::span<Index> buckets, std::span<Index> people) {
+     Index next = 0;
+     for (auto& bucket : buckets) {
+         auto size = bucket;
