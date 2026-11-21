@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
@@ -70,10 +71,18 @@ struct Column {
 };
 
 inline void plain(Bytes& bytes, View text) {
-    if (text.size() > uint32_t(std::numeric_limits<int32_t>::max()))
+    if (text.size() > size_t(std::numeric_limits<int32_t>::max()) - sizeof(uint32_t))
         throw std::runtime_error("Parquet string exceeds page limit");
     little_endian(bytes, static_cast<uint32_t>(text.size()));
     if (!text.empty()) bytes.insert(bytes.end(), text.begin(), text.end());
+}
+
+inline size_t row_group_limit(size_t longest_string) {
+    constexpr size_t target_page_bytes = 8 << 20;
+    constexpr size_t max_rows = 32768;
+    // Bound PLAIN string lengths, definition levels and fixed-width columns.
+    size_t per_row = std::max<size_t>(8, longest_string + 5);
+    return std::clamp<size_t>((target_page_bytes - 16) / per_row, 1, max_rows);
 }
 
 class File {

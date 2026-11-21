@@ -428,22 +428,171 @@ int64_t ingest_timestamp(View s) {
 
 int32_t utc_day(int64_t t) { return t / day_ms - (t % day_ms < 0); }
 
+class ManifestJson {
+    View rest_;
+
+    [[noreturn]] static void fail() { throw std::runtime_error("invalid manifest JSON"); }
+
+    char peek() const { return rest_.empty() ? '\0' : rest_.front(); }
+    char next() {
+        if (rest_.empty()) fail();
+        char c = rest_.front();
+        rest_.remove_prefix(1);
+        return c;
+    }
+    void whitespace() {
+        while (peek() == ' ' || peek() == '\n' || peek() == '\r' || peek() == '\t') next();
+    }
+    bool take(char c) {
+        if (peek() != c) return false;
+        next();
+        return true;
+    }
+    void require(char c) { if (!take(c)) fail(); }
+    void literal(View word) {
+        if (!rest_.starts_with(word)) fail();
+        rest_.remove_prefix(word.size());
+    }
+    static bool digit(char c) { return unsigned(c - '0') < 10; }
+    void digits() {
+        if (!digit(peek())) fail();
+        do { next(); } while (digit(peek()));
+    }
+    void number() {
+        take('-');
+        if (!take('0')) digits();
+        if (take('.')) digits();
+        if (take('e') || take('E')) {
+            if (!take('+')) take('-');
+            digits();
+        }
+    }
+    unsigned hex4() {
+        unsigned result = 0;
+        for (int i = 0; i < 4; ++i) {
+            char c = next();
+            if (!digit(c) && unsigned((c | 32) - 'a') >= 6) fail();
+            result = (result << 4) + (digit(c) ? c - '0' : (c | 32) - 'a' + 10);
+        }
+        return result;
+    }
+    static void utf8(std::string& value, unsigned cp) {
+        if (cp <= 0x7f) {
+            value += char(cp);
+        } else if (cp <= 0x7ff) {
+            value += char(0xc0 | (cp >> 6));
+            value += char(0x80 | (cp & 63));
+        } else if (cp <= 0xffff) {
+            value += char(0xe0 | (cp >> 12));
+            value += char(0x80 | ((cp >> 6) & 63));
+            value += char(0x80 | (cp & 63));
+        } else {
+            value += char(0xf0 | (cp >> 18));
+            value += char(0x80 | ((cp >> 12) & 63));
+            value += char(0x80 | ((cp >> 6) & 63));
+            value += char(0x80 | (cp & 63));
+        }
+    }
+    std::string string() {
+        require('"');
+        std::string value;
+        for (char c; (c = next()) != '"';) {
+            if (uint8_t(c) < 32) fail();
+            if (c != '\\') {
+                value += c;
+                continue;
+            }
+            switch (c = next()) {
+                case '"': case '\\': case '/': value += c; break;
+                case 'b': value += '\b'; break;
+                case 'f': value += '\f'; break;
+                case 'n': value += '\n'; break;
+                case 'r': value += '\r'; break;
+                case 't': value += '\t'; break;
+                case 'u': {
+                    unsigned cp = hex4();
+                    if (cp >= 0xd800 && cp <= 0xdbff && rest_.starts_with("\\u")) {
+                        View saved = rest_;
+                        rest_.remove_prefix(2);
+                        unsigned low = hex4();
+                        if (low >= 0xdc00 && low <= 0xdfff)
+                            cp = 0x10000 + ((cp - 0xd800) << 10) + low - 0xdc00;
+                        else
+                            rest_ = saved;
+                    }
+                    utf8(value, cp);
+                    break;
+                }
+                default: fail();
+            }
+        }
+        return value;
+    }
+    template<class Item> void items(char end, Item item) {
+        whitespace();
+        if (take(end)) return;
+        do {
+            whitespace();
+            item();
+            whitespace();
+        } while (take(','));
+        require(end);
+    }
+    void colon() {
+        whitespace();
+        require(':');
+        whitespace();
+    }
+    void skip() {
+        switch (peek()) {
+            case '{':
+                next();
+                items('}', [&] { string(); colon(); skip(); });
+                break;
+            case '[': next(); items(']', [&] { skip(); }); break;
+            case '"': string(); break;
+            case 't': literal("true"); break;
+            case 'f': literal("false"); break;
+            case 'n': literal("null"); break;
+            default: number(); break;
+        }
+    }
+
+public:
+    explicit ManifestJson(View bytes) : rest_(bytes) {
+        if (rest_.starts_with("\xef\xbb\xbf")) rest_.remove_prefix(3);
+    }
+
+    std::array<std::string, 2> window() {
+        std::array<std::string, 2> fields;
+        whitespace();
+        require('{');
+        items('}', [&] {
+            std::string name = string();
+            colon();
+            if (name == "window_start" || name == "window_end") {
+                auto& field = fields[name == "window_end"];
+                if (peek() == '"') {
+                    field = string();
+                    return;
+                }
+                field.clear();
+            }
+            skip();
+        });
+        whitespace();
+        if (!rest_.empty()) fail();
+        return fields;
+    }
+};
+
 struct Window {
     int64_t start, end;
     explicit Window(const fs::path& path) {
         Mapping file(path);
-        auto read = [&](View key) {
-            View bytes = file.bytes();
-            size_t at = bytes.find(key);
-            if (at == View::npos) throw std::runtime_error("missing manifest field");
-            size_t colon = bytes.find(':', at + key.size());
-            size_t open = colon == View::npos ? View::npos : bytes.find('"', colon + 1);
-            size_t end = open == View::npos ? View::npos : bytes.find('"', open + 1);
-            if (end == View::npos) throw std::runtime_error("invalid manifest field");
-            return timestamp(bytes.substr(open + 1, end - open - 1));
-        };
-        start = read("\"window_start\"");
-        end = read("\"window_end\"");
+        auto fields = ManifestJson(file.bytes()).window();
+        start = timestamp(fields[0]);
+        end = timestamp(fields[1]);
         if (start == bad_time || end == bad_time || start >= end)
             throw std::runtime_error("invalid manifest window");
     }
@@ -460,6 +609,7 @@ class Ids {
         std::mutex lock;
         StringMap<uint32_t> indices;
         std::vector<View> names;
+        size_t longest = 0;
     };
     std::array<Shard, 64> shards_;
 
@@ -496,11 +646,20 @@ public:
             auto& shard = shards_[index];
             std::lock_guard lock(shard.lock);
             auto [position, inserted] = shard.indices.try_emplace(bytes, shard.names.size());
-            if (inserted) shard.names.push_back(bytes);
+            if (inserted) {
+                shard.names.push_back(bytes);
+                shard.longest = std::max(shard.longest, bytes.size());
+            }
             value = external | (uint64_t(index) << 32) | position->second;
         }
         value *= multiplier;
         return value ^ (value >> 32);
+    }
+
+    size_t longest() const {
+        size_t length = 9;
+        for (const auto& shard : shards_) length = std::max(length, shard.longest);
+        return length;
     }
 
     // Called after the input stages have stopped interning IDs.
@@ -942,10 +1101,14 @@ constexpr Column campaign_schema[] = {{"campaign_id", Column::Text, 0}, {"channe
     {"day", Column::Int32, 6}, {"sessions", Column::Int64}, {"purchasing_sessions", Column::Int64},
     {"revenue_cents", Column::Int64}, {"assisted_sessions", Column::Int64}};
 
-constexpr size_t group_rows = 32768;
+size_t longest_string(const std::vector<View>& strings) {
+    size_t length = 0;
+    for (View value : strings) length = std::max(length, value.size());
+    return length;
+}
 
 void write_users(parquet::File& file, std::span<const UserDaily> users, const Catalogs& catalogs,
-                 const Ids& ids) {
+                 const Ids& ids, size_t group_rows) {
     using parquet::little_endian;
     using parquet::plain;
     while (!users.empty()) {
@@ -979,6 +1142,8 @@ void write_campaigns(const fs::path& path, const CampaignTotals& totals, const C
     std::vector<std::pair<uint64_t, const CampaignDaily*>> rows;
     totals.each([&](uint64_t key, const CampaignDaily& row) { rows.emplace_back(key, &row); });
     parquet::File file(path, campaign_schema);
+    size_t group_rows = parquet::row_group_limit(
+        std::max(longest_string(catalogs.campaigns), longest_string(catalogs.channels)));
     for (size_t offset = 0; offset < rows.size(); offset += group_rows) {
         auto group = std::span(rows).subspan(offset, std::min(group_rows, rows.size() - offset));
         file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
@@ -1005,13 +1170,36 @@ std::string env(const char* key, const char* fallback) {
     return value && *value ? value : fallback;
 }
 
+uint64_t positive_env(const char* key, const char* fallback) {
+    auto text = env(key, fallback);
+    uint64_t value = 0;
+    auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || !value)
+        throw std::runtime_error(std::string("invalid ") + key);
+    return value;
+}
+
+void cap_memory(uint64_t gb) {
+    constexpr uint64_t gib = uint64_t{1} << 30;
+    if (gb > std::numeric_limits<rlim_t>::max() / gib)
+        throw std::runtime_error("invalid MEM_GB");
+#if defined(__linux__)
+    // The scorer also enforces a cgroup memory limit. Bound our own mapped
+    // address space so an undersized budget fails through the allocation path.
+    rlimit limit{};
+    if (getrlimit(RLIMIT_AS, &limit) != 0) throw std::runtime_error("cannot read memory limit");
+    rlim_t budget = gb * gib;
+    if (budget < limit.rlim_cur) {
+        limit.rlim_cur = budget;
+        if (setrlimit(RLIMIT_AS, &limit) != 0) throw std::runtime_error("cannot set MEM_GB");
+    }
+#endif
+}
+
 int main(int argc, char** argv) try {
     Trace trace;
-    unsigned threads = 8;
-    auto ncpu = env("NCPU", "8");
-    auto parsed = std::from_chars(ncpu.data(), ncpu.data() + ncpu.size(), threads);
-    if (parsed.ec != std::errc()) throw std::runtime_error("invalid NCPU");
-    threads = std::clamp(threads, 1u, 8u);
+    unsigned threads = std::min<uint64_t>(8, positive_env("NCPU", "8"));
+    cap_memory(positive_env("MEM_GB", "24"));
     fs::path data = argc > 1 ? argv[1] : env("DATA_DIR", "/data");
     fs::path out = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
     const Window window(data / "manifest.json");
@@ -1052,6 +1240,8 @@ int main(int argc, char** argv) try {
 
     fs::create_directories(out / "user_daily");
     fs::create_directories(out / "campaign_daily");
+    size_t user_group_rows = parquet::row_group_limit(
+        std::max(ids.longest(), longest_string(catalogs->categories)));
     std::vector<std::unique_ptr<parquet::File>> writers(threads);
     std::vector<CampaignTotals> campaign_totals;
     campaign_totals.reserve(threads);
@@ -1070,7 +1260,7 @@ int main(int argc, char** argv) try {
         auto& writer = writers[worker];
         if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
             ("part-" + std::to_string(worker) + ".parquet"), user_schema);
-        write_users(*writer, users, *catalogs, ids);
+        write_users(*writer, users, *catalogs, ids, user_group_rows);
     });
     trace.mark("sessions_user_output");
 
