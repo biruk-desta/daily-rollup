@@ -1,0 +1,1113 @@
+diff --git a/csv_index.hpp b/csv_index.hpp
+index 34b4982..e2a68f6 100644
+--- a/csv_index.hpp
++++ b/csv_index.hpp
+@@ -1,13 +1,34 @@
+ #pragma once
+ 
+ struct CsvMarkers { uint64_t commas, lines, quotes; };
++constexpr uint16_t csv_quote_bit = 1u << 15;
++constexpr uint16_t csv_end_mask = csv_quote_bit - 1;
+ 
+-template<size_t... Slots>
++template<bool ZeroCount> [[gnu::always_inline]] inline unsigned csv_first(uint64_t mask) {
++    if constexpr (ZeroCount) {
++#if defined(__x86_64__)
++        uint64_t position;
++        asm("tzcntq %1, %0" : "=r"(position) : "r"(mask) : "cc");
++        return position;
++#else
++        return std::countr_zero(mask);
++#endif
++    } else {
++        return __builtin_ctzll(mask | (uint64_t{1} << 63));
++    }
++}
++
++template<bool QuoteFlags = false, bool ZeroCount = false, size_t... Slots>
+ [[gnu::always_inline]] inline void csv_positions(uint16_t*& out, unsigned base, uint64_t mask,
+-                                                 std::index_sequence<Slots...>) {
++                                                 std::index_sequence<Slots...>, uint64_t quoted = 0) {
+     unsigned count = std::popcount(mask);
++    auto encode = [&](unsigned position) {
++        unsigned end = base + position;
++        if constexpr (QuoteFlags) end |= ((quoted >> (position & 63)) & 1) << 15;
++        return end;
++    };
+     auto write = [&](size_t slot) {
+-        out[slot] = base + __builtin_ctzll(mask | (uint64_t{1} << 63));
++        out[slot] = encode(csv_first<ZeroCount>(mask));
+         mask &= mask - 1;
+     };
+     (write(Slots), ...);
+@@ -15,21 +36,29 @@ template<size_t... Slots>
+     auto* excess = out + sizeof...(Slots);
+     out += count;
+     for (; excess < out; ++excess) {
+-        *excess = base + __builtin_ctzll(mask);
++        *excess = encode(__builtin_ctzll(mask));
+         mask &= mask - 1;
+     }
+ }
+ 
+-struct IndexedCsvRow {
++enum class CsvQuotes { Probe, Flagged, None };
++
++template<CsvQuotes Quotes> struct IndexedCsvRow {
+     const char* data;
+     const uint16_t* ends;
+     unsigned begin;
+ 
+     template<size_t I> size_t field(const char*& text) const {
+         unsigned start = I ? ends[I - 1] + 1 : begin;
+-        unsigned quoted = data[start] == '"';
++        unsigned end = ends[I], quoted = 0;
++        if constexpr (Quotes == CsvQuotes::Probe) quoted = data[start] == '"';
++        if constexpr (Quotes == CsvQuotes::Flagged) {
++            start &= csv_end_mask;
++            quoted = end >> 15;
++            end &= csv_end_mask;
++        }
+         text = data + start + quoted;
+-        return ends[I] - start - 2 * quoted;
++        return end - start - 2 * quoted;
+     }
+ };
+ 
+@@ -45,6 +74,7 @@ template<size_t N> struct ScalarCsvRow {
+ class CsvIndex {
+ public:
+     static constexpr size_t batch_bytes = 16 * 1024;
++    static_assert(batch_bytes + 64 < csv_quote_bit);
+ 
+ private:
+     uint16_t ends_[batch_bytes + 12], lines_[batch_bytes + 4], errors_[batch_bytes + 1];
+@@ -60,8 +90,22 @@ private:
+         }
+     }
+ 
++    template<size_t N> static bool has_quoted_field(const uint16_t* field) {
++        if constexpr (N >= 4) {
++            uint64_t first, last;
++            std::memcpy(&first, field, sizeof(first));
++            std::memcpy(&last, field + N - 4, sizeof(last));
++            return (first | last) & 0x8000800080008000ULL;
++        } else {
++            uint16_t mask = 0;
++            for (size_t i = 0; i < N; ++i) mask |= field[i];
++            return mask & csv_quote_bit;
++        }
++    }
++
+ public:
+-    template<size_t Ends, size_t Lines> [[gnu::always_inline]] void block(unsigned base, CsvMarkers marks) {
++    template<size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount>
++    [[gnu::always_inline]] void block(unsigned base, CsvMarkers marks) {
+         uint64_t sep = marks.commas | marks.lines;
+         uint64_t open = marks.quotes & ((sep << 1) | after_separator_);
+         uint64_t close = marks.quotes ^ open;
+@@ -74,12 +118,13 @@ public:
+         after_separator_ = sep >> 63;
+         after_open_ = open >> 63;
+         after_close_ = close >> 63;
+-        csv_positions(end_, base, sep, std::make_index_sequence<Ends>{});
+-        csv_positions(line_, base, marks.lines, std::make_index_sequence<Lines>{});
++        csv_positions<QuoteFlags, ZeroCount>(end_, base, sep, std::make_index_sequence<Ends>{}, wrapped);
++        csv_positions<false, ZeroCount>(line_, base, marks.lines, std::make_index_sequence<Lines>{});
+         append(error_, base, bad);
+     }
+ 
+-    template<size_t N, class Row> void parse(const char* data, Row& row) {
++    template<size_t N, bool QuoteFlags, class Row> void parse(const char* data, Row& row) {
++        constexpr uint16_t position_mask = QuoteFlags ? csv_end_mask : UINT16_MAX;
+         std::fill_n(end_, N, UINT16_MAX);
+         *error_ = UINT16_MAX;
+         auto field = ends_;
+@@ -87,11 +132,16 @@ public:
+         unsigned begin = 0;
+         for (auto line = lines_; line != line_; ++line) {
+             unsigned end = *line;
+-            if (field[N - 1] == end && *error > end) {
+-                row(IndexedCsvRow{data, field, begin});
++            if ((field[N - 1] & position_mask) == end && *error > end) {
++                if constexpr (QuoteFlags) {
++                    if (has_quoted_field<N>(field)) row(IndexedCsvRow<CsvQuotes::Flagged>{data, field, begin});
++                    else row(IndexedCsvRow<CsvQuotes::None>{data, field, begin});
++                } else {
++                    row(IndexedCsvRow<CsvQuotes::Probe>{data, field, begin});
++                }
+                 field += N;
+             } else {
+-                while (*field <= end) ++field;
++                while ((*field & position_mask) <= end) ++field;
+                 while (*error <= end) ++error;
+             }
+             begin = end + 1;
+@@ -143,54 +193,70 @@ inline size_t csv_prefetch_distance() {
+     return distance;
+ }
+ 
+-template<auto Mark, size_t Ends, size_t Lines>
++template<auto Mark, size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount>
+ [[gnu::always_inline]] inline void csv_blocks_impl(CsvIndex& index, View input, size_t size) {
+     unsigned offset = 0;
+     size_t distance = csv_prefetch_distance();
+     size_t prefetch_until = distance && distance < input.size() ? input.size() - distance : 0;
+     for (; offset + 64 <= size; offset += 64) {
+         if (offset < prefetch_until) __builtin_prefetch(input.data() + offset + distance, 0, 3);
+-        index.block<Ends, Lines>(offset, Mark(input.data() + offset));
++        index.block<Ends, Lines, QuoteFlags, ZeroCount>(offset, Mark(input.data() + offset));
+     }
+     if (offset < size) {
+         alignas(64) char tail[64]{};
+         std::memcpy(tail, input.data() + offset, size - offset);
+-        index.block<Ends, Lines>(offset, Mark(tail));
++        index.block<Ends, Lines, QuoteFlags, ZeroCount>(offset, Mark(tail));
+     }
+ }
+ 
+-template<auto Mark, size_t Ends, size_t Lines> struct CsvBlocks {
++template<auto Mark, size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount> struct CsvBlocks {
+     static void run(CsvIndex& index, View input, size_t size) {
+-        csv_blocks_impl<Mark, Ends, Lines>(index, input, size);
++        csv_blocks_impl<Mark, Ends, Lines, QuoteFlags, ZeroCount>(index, input, size);
+     }
+ };
+ 
+ #if defined(__x86_64__)
+-template<size_t Ends, size_t Lines> struct CsvBlocks<csv_avx2, Ends, Lines> {
++template<size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount>
++struct CsvBlocks<csv_avx2, Ends, Lines, QuoteFlags, ZeroCount> {
+     __attribute__((target("avx2,popcnt"))) static void run(CsvIndex& index, View input, size_t size) {
+-        csv_blocks_impl<csv_avx2, Ends, Lines>(index, input, size);
++        csv_blocks_impl<csv_avx2, Ends, Lines, QuoteFlags, ZeroCount>(index, input, size);
+     }
+ };
+ 
+-template<size_t Ends, size_t Lines> struct CsvBlocks<csv_avx512, Ends, Lines> {
++template<size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount>
++struct CsvBlocks<csv_avx512, Ends, Lines, QuoteFlags, ZeroCount> {
+     __attribute__((target("avx512bw,popcnt"))) static void run(CsvIndex& index, View input, size_t size) {
+-        csv_blocks_impl<csv_avx512, Ends, Lines>(index, input, size);
++        csv_blocks_impl<csv_avx512, Ends, Lines, QuoteFlags, ZeroCount>(index, input, size);
+     }
+ };
+ #endif
+ 
+-template<auto Mark> inline void csv_blocks(CsvIndex& index, View input, size_t size) {
++inline bool csv_zero_count() {
++#if defined(__x86_64__)
++    unsigned a, b, c, d;
++    if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(b & bit_BMI)) return false;
++#endif
++    const char* value = std::getenv("SHOPPING_CSV_TZCNT");
++    return value && std::strcmp(value, "1") == 0;
++}
++
++template<auto Mark, bool QuoteFlags, bool ZeroCount> auto csv_block_runner(const char* setting) {
++    if (setting && std::strcmp(setting, "4/1") == 0) return &CsvBlocks<Mark, 4, 1, QuoteFlags, ZeroCount>::run;
++    if (setting && std::strcmp(setting, "12/4") == 0) return &CsvBlocks<Mark, 12, 4, QuoteFlags, ZeroCount>::run;
++    if (setting && std::strcmp(setting, "0/0") == 0) return &CsvBlocks<Mark, 0, 0, QuoteFlags, ZeroCount>::run;
++    return &CsvBlocks<Mark, 8, 2, QuoteFlags, ZeroCount>::run;
++}
++
++template<auto Mark, bool QuoteFlags> inline void csv_blocks(CsvIndex& index, View input, size_t size) {
+     static const auto run = [] {
+         const char* setting = std::getenv("SHOPPING_CSV_WRITES");
+-        if (setting && std::strcmp(setting, "4/1") == 0) return &CsvBlocks<Mark, 4, 1>::run;
+-        if (setting && std::strcmp(setting, "12/4") == 0) return &CsvBlocks<Mark, 12, 4>::run;
+-        if (setting && std::strcmp(setting, "0/0") == 0) return &CsvBlocks<Mark, 0, 0>::run;
+-        return &CsvBlocks<Mark, 8, 2>::run;
++        return csv_zero_count() ? csv_block_runner<Mark, QuoteFlags, true>(setting)
++                                : csv_block_runner<Mark, QuoteFlags, false>(setting);
+     }();
+     run(index, input, size);
+ }
+ 
+-template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row) {
++template<size_t N, auto Mark, bool QuoteFlags, class Row> void scan_indexed_impl(View chunk, Row& row) {
+     while (!chunk.empty()) {
+         size_t size = std::min(chunk.size(), CsvIndex::batch_bytes);
+         while (size && chunk[size - 1] != '\n') --size;
+@@ -203,10 +269,23 @@ template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row)
+             CsvIndex index;
+             {
+                 SHOPPING_TIME(timing::Scope markers(timing::MarkerScan);)
+-                csv_blocks<Mark>(index, chunk, size);
++                csv_blocks<Mark, QuoteFlags>(index, chunk, size);
+             }
+-            index.parse<N>(chunk.data(), row);
++            index.parse<N, QuoteFlags>(chunk.data(), row);
+         }
+         chunk.remove_prefix(size);
+     }
+ }
++
++inline bool csv_quote_flags() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("SHOPPING_CSV_QUOTE_FLAGS");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row) {
++    if (csv_quote_flags()) scan_indexed_impl<N, Mark, true>(chunk, row);
++    else scan_indexed_impl<N, Mark, false>(chunk, row);
++}
+diff --git a/main.cpp b/main.cpp
+index d4117d2..3b06535 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -513,30 +513,16 @@ constexpr auto years = [] {
+ constexpr int month_lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+ constexpr int month_offsets[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+ 
+-int64_t timestamp(View s) {
+-    if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
+-        return decimal(s, INT64_MAX);
+-    if (s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') return bad_time;
+-    const char* p = s.data();
++int64_t calendar_midnight(const char* p) {
++    if (p[4] != '-' || p[7] != '-' || p[10] != 'T') return bad_time;
+     int century = two_digits(p), yr = two_digits(p + 2);
+     int m = two_digits(p + 5), d = two_digits(p + 8);
+-    int h = two_digits(p + 11), minute = two_digits(p + 14), second = two_digits(p + 17);
+     int y = century * 100 + yr;
+-    if ((century | yr) < 0 || y < 1 || m < 1 || m > 12 || d < 1 || unsigned(h) > 23 ||
+-        unsigned(minute) > 59 || unsigned(second) > 59) return bad_time;
++    if ((century | yr) < 0 || y < 1 || m < 1 || m > 12 || d < 1) return bad_time;
+     auto [year_days, leap] = years[y];
+     if (d > month_lengths[m - 1] + (m == 2 && leap)) return bad_time;
+     int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+-    int offset = 0;
+-    if (s.size() == 20) {
+-        if (s[19] != 'Z') return bad_time;
+-    } else {
+-        if ((s[19] != '-' && s[19] != '+') || s[22] != ':') return bad_time;
+-        int oh = two_digits(p + 20), om = two_digits(p + 23);
+-        if (unsigned(oh) > 23 || unsigned(om) > 59) return bad_time;
+-        offset = (oh * 60 + om) * (s[19] == '+' ? 1 : -1);
+-    }
+-    return int64_t(days) * day_ms + ((h * 60 + minute - offset) * 60 + second) * 1000;
++    return int64_t(days) * day_ms;
+ }
+ 
+ int64_t epoch_millis_13(const char* p) {
+@@ -569,24 +555,42 @@ int clock_seconds(const char* p) {
+     return h * 3600 + m * 60 + s;
+ }
+ 
+-int ingest_pair(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
++constexpr int bad_offset = std::numeric_limits<int>::min();
+ 
+-int ingest_seconds(const char* p) {
+-    uint64_t digits;
+-    std::memcpy(&digits, p, sizeof(digits));
+-    digits = (digits ^ 0x3030003030003030ULL) & 0xffff00ffff00ffffULL;
+-    if ((digits | (digits + 0x0606000606000606ULL)) & 0xf0f000f0f000f0f0ULL)
+-        return (ingest_pair(p) * 60 + ingest_pair(p + 3)) * 60 + ingest_pair(p + 6);
+-    uint64_t pairs = digits * 10 + (digits >> 8);
+-    return uint8_t(pairs) * 3600 + uint8_t(pairs >> 24) * 60 + uint8_t(pairs >> 48);
++int offset_seconds(const char* p) {
++    char sign = p[19];
++    if (sign != '+' && sign != '-') return bad_offset;
++    uint64_t word;
++    std::memcpy(&word, p + 17, sizeof(word));
++    word = (word >> 24) ^ 0x30303a3030ULL;
++    if ((word | (word + 0x0606000606ULL)) & 0xf0f0fff0f0ULL) return bad_offset;
++    uint64_t pairs = word * 10 + (word >> 8);
++    unsigned h = uint8_t(pairs), m = uint8_t(pairs >> 24);
++    if ((h > 23) | (m > 59)) return bad_offset;
++    int seconds = h * 3600 + m * 60;
++    return sign == '+' ? seconds : -seconds;
+ }
+ 
+-int64_t ingest_timestamp(const char* p) {
+-    int y = ingest_pair(p) * 100 + ingest_pair(p + 2), m = ingest_pair(p + 5), d = ingest_pair(p + 8);
+-    if (unsigned(y) >= years.size() || unsigned(m - 1) >= 12) return bad_time;
+-    auto [year_days, leap] = years[y];
+-    int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+-    return int64_t(days) * day_ms + int64_t(ingest_seconds(p + 11)) * 1000;
++template<bool Offset> int64_t clock_millis(const char* p) {
++    int seconds = clock_seconds(p + 11);
++    if (seconds < 0) return bad_time;
++    if constexpr (Offset) {
++        int offset = offset_seconds(p);
++        if (offset == bad_offset) return bad_time;
++        seconds -= offset;
++    } else {
++        if (p[19] != 'Z') return bad_time;
++    }
++    return seconds * 1000;
++}
++
++int64_t timestamp(View s) {
++    if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
++        return decimal(s, INT64_MAX);
++    int64_t midnight = calendar_midnight(s.data());
++    if (midnight == bad_time) return bad_time;
++    int64_t clock = s.size() == 20 ? clock_millis<false>(s.data()) : clock_millis<true>(s.data());
++    return clock == bad_time ? bad_time : midnight + clock;
+ }
+ 
+ int32_t utc_day(int64_t t) { return t / day_ms - (t % day_ms < 0); }
+@@ -751,30 +755,58 @@ public:
+ 
+ struct Window {
+ private:
+-    struct Date { uint64_t prefix; uint32_t suffix; int32_t day; };
+-    std::array<Date, 64> dates_{};
+-
+-    static size_t date_slot(const char* s) {
++    struct Date {
++        uint64_t prefix = 0;
++        uint32_t suffix = UINT32_MAX;
++        int64_t midnight = 0, relative_midnight = 0;
++    };
++    std::array<Date, 128> dates_{};
++    bool packed_slot_ = false;
++    bool wide_key_ = false;
++
++    size_t date_slot(const char* s) const {
++        if (packed_slot_) {
++            uint32_t word;
++            std::memcpy(&word, s + 6, sizeof(word));
++            constexpr uint32_t date_bits = 0x0f030001U;
++            constexpr uint32_t pack_day_and_month = 0x80002002U;
++            return ((word & date_bits) * pack_day_and_month) >> 25;
++        }
+         return ((uint8_t(s[6]) & 1) << 5) | ((uint8_t(s[8]) * 10 + uint8_t(s[9])) & 31);
+     }
+ 
+-    static Date date_key(const char* s) {
+-        Date result{};
++    Date date_key(const char* s) const {
++        Date result;
+         std::memcpy(&result.prefix, s, 8);
+-        std::memcpy(&result.suffix, s + 8, 3);
++        if (wide_key_) {
++            std::memcpy(&result.suffix, s + 7, sizeof(result.suffix));
++        } else {
++            result.suffix = 0;
++            std::memcpy(&result.suffix, s + 8, 3);
++        }
+         return result;
+     }
+ 
+     const Date* cached_date(const char* s) const {
+         auto key = date_key(s);
+         const auto& entry = dates_[date_slot(s)];
+-        return entry.prefix && ((entry.prefix ^ key.prefix) | (entry.suffix ^ key.suffix)) == 0
+-            ? &entry : nullptr;
++        return ((entry.prefix ^ key.prefix) | (entry.suffix ^ key.suffix)) == 0 ? &entry : nullptr;
++    }
++
++    template<bool Relative> int64_t from_epoch(int64_t time) const {
++        if constexpr (Relative) {
++            if (time != bad_time) return std::bit_cast<int64_t>(uint64_t(time) - uint64_t(start));
++        }
++        return time;
+     }
+ 
+ public:
+     int64_t start, end;
+     explicit Window(const fs::path& path) {
++        const char* packed_slot = std::getenv("SHOPPING_DATE_PACKED_SLOT");
++        packed_slot_ = packed_slot && std::strcmp(packed_slot, "1") == 0;
++        const char* wide_key = std::getenv("SHOPPING_DATE_WIDE_KEY");
++        wide_key_ = wide_key && std::strcmp(wide_key, "1") == 0;
+         Mapping file(path);
+         auto fields = ManifestJson(file.bytes()).window();
+         start = timestamp(fields[0]);
+@@ -792,26 +824,30 @@ public:
+                           unsigned(date.month()), unsigned(date.day()));
+             auto& entry = dates_[date_slot(key)];
+             entry = date_key(key);
+-            entry.day = day;
++            entry.midnight = int64_t(day) * day_ms;
++            entry.relative_midnight = entry.midnight - start;
+         }
+     }
+ 
+-    int64_t event_time(View text) const {
+-        if (text.size() == 13) return epoch_millis_13(text.data());
+-        if (text.size() == 20 && text[19] == 'Z') {
++    template<bool Relative = false> int64_t event_time(View text) const {
++        if (text.size() == 13) return from_epoch<Relative>(epoch_millis_13(text.data()));
++        if (text.size() == 20 || text.size() == 25) {
+             if (auto* date = cached_date(text.data())) {
+-                int seconds = clock_seconds(text.data() + 11);
+-                return seconds < 0 ? bad_time : int64_t(date->day) * day_ms + seconds * 1000;
++                int64_t clock = text.size() == 20 ? clock_millis<false>(text.data()) : clock_millis<true>(text.data());
++                if (clock == bad_time) return bad_time;
++                return (Relative ? date->relative_midnight : date->midnight) + clock;
+             }
+         }
+-        return timestamp(text);
++        return from_epoch<Relative>(timestamp(text));
+     }
+ 
+     int64_t ingest_time(View text) const {
+-        if (text.size() != 20) return bad_time;
+-        if (auto* date = cached_date(text.data()))
+-            return int64_t(date->day) * day_ms + int64_t(ingest_seconds(text.data() + 11)) * 1000;
+-        return ingest_timestamp(text.data());
++        if (text.size() != 20 || text[19] != 'Z') return bad_time;
++        int64_t clock = clock_millis<false>(text.data());
++        if (clock == bad_time) return bad_time;
++        if (auto* date = cached_date(text.data())) return date->midnight + clock;
++        int64_t midnight = calendar_midnight(text.data());
++        return midnight == bad_time ? bad_time : midnight + clock;
+     }
+ };
+ 
+@@ -1105,12 +1141,32 @@ public:
+ 
+     void prefetch_alias(Person key) const { __builtin_prefetch(aliases_->data() + (key & mask_), 0, 1); }
+ 
+-    Person lookup(Person key) const {
+-        auto value = (*aliases_)[slot(key)].value;
+-        return value ? value : key;
++    static bool direct_lookup() {
++        static const bool direct = [] {
++            const char* value = std::getenv("SHOPPING_ALIAS_DIRECT_PROBE");
++            return value && std::strcmp(value, "1") == 0;
++        }();
++        return direct;
+     }
+ 
+-    Person name(Person key) const { return !bitmap() || might_have_alias(key) ? lookup(key) : key; }
++    template<bool Direct> Person lookup(Person key) const {
++        if constexpr (Direct) {
++            const auto* data = aliases_->data();
++            for (size_t i = key & mask_;; i = (i + 1) & mask_) {
++                Person found = data[i].key;
++                if (!found) return key;
++                if (found == key) return data[i].value;
++            }
++        } else {
++            auto value = (*aliases_)[slot(key)].value;
++            return value ? value : key;
++        }
++    }
++
++    Person name(Person key) const {
++        if (bitmap() && !might_have_alias(key)) return key;
++        return direct_lookup() ? lookup<true>(key) : lookup<false>(key);
++    }
+ };
+ 
+ class LinkBuild {
+@@ -1239,6 +1295,14 @@ template<class Row, class Emit> class PersonBatch {
+     std::array<Row, max_alias_batch> rows_;
+     size_t size_ = 0;
+ 
++    template<bool Direct> void resolve(const std::array<bool, max_alias_batch>& probe) {
++        for (size_t i = 0; i < size_; ++i) {
++            auto& row = rows_[i];
++            if (!bitmap_ || probe[i]) row.person = people_.lookup<Direct>(row.person);
++            emit_(row);
++        }
++    }
++
+ public:
+     PersonBatch(const People& people, size_t limit, Emit emit)
+         : people_(people), limit_(limit), bitmap_(people.bitmap()), emit_(emit) {}
+@@ -1263,11 +1327,8 @@ public:
+                 probe[i] = people_.might_have_alias(person);
+                 if (probe[i]) people_.prefetch_alias(person);
+             }
+-        for (size_t i = 0; i < size_; ++i) {
+-            auto& row = rows_[i];
+-            if (!bitmap_ || probe[i]) row.person = people_.lookup(row.person);
+-            emit_(row);
+-        }
++        if (People::direct_lookup()) resolve<true>(probe);
++        else resolve<false>(probe);
+         size_ = 0;
+     }
+ };
+@@ -1375,9 +1436,9 @@ struct CompactCandidate {
+     CompactEvent payload;
+ 
+     CompactCandidate() = default;
+-    CompactCandidate(uint64_t id, int64_t ingest, Event<Category> event, const Window& window)
++    CompactCandidate(uint64_t id, int64_t ingest, Event<Category> event, const Window&)
+         : id(id), ingest(ingest), payload{event.person, event.person
+-            ? uint64_t(event.value.time - window.start) << 32 |
++            ? uint64_t(event.value.time) << 32 |
+               uint64_t(event.value.category) << 24 | event.value.price
+             : 0} {}
+ };
+@@ -1408,9 +1469,10 @@ template<class Category> EventValue<Category> unpack(EventValue<Category> value,
+ 
+ #include "session_buckets.hpp"
+ 
+-template<class Category, class Row>
+-Event<Category> parse_event(const Row& fields, const Window& window, const Catalogs& catalogs,
+-                            Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
++template<class Candidate, class Row>
++Event<typename Candidate::Category> parse_event(const Row& fields, const Window& window, const Catalogs& catalogs,
++                                                Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
++    using Category = typename Candidate::Category;
+     SHOPPING_TIME(timing::Scope validation(timing::Validate, weight);)
+     if (ingest == bad_time) return {};
+     const char *user, *product, *type, *ts;
+@@ -1423,8 +1485,14 @@ Event<Category> parse_event(const Row& fields, const Window& window, const Catal
+     if (!purchase && (type_size != 4 || (std::memcmp(type, "view", 4) && std::memcmp(type, "cart", 4))))
+         return {};
+     size_t ts_size = fields.template field<2>(ts);
+-    int64_t time = window.event_time(View(ts, ts_size));
+-    if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
++    constexpr bool relative = std::is_same_v<Candidate, CompactCandidate>;
++    int64_t time = window.event_time<relative>(View(ts, ts_size));
++    if constexpr (relative) {
++        if (uint64_t(time) >= uint64_t(window.end) - uint64_t(window.start) ||
++            time + window.start < ingest - day_ms) return {};
++    } else {
++        if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
++    }
+     uint32_t price = 0;
+     Category category = 0;
+     if (purchase) {
+@@ -1443,12 +1511,13 @@ Event<Category> parse_event(const Row& fields, const Window& window, const Catal
+     return {person, {time, price, category}};
+ }
+ 
+-template<class Candidate>
++template<class Candidate, class ClickWork, class ClickFinish>
+ void read_events(const Input& input, unsigned threads, Trace& trace,
+                  const Window& window, const Catalogs& catalogs, const Input& links, Ids& ids,
+                  People& people, ScatterWorkers<Candidate>& entries, size_t buckets, size_t ingest_buckets,
+                  ScatterWorkers<typename Candidate::Survivor>& records, size_t partitions, size_t alias_batch,
+-                 int alias_load, bool alias_bitmap, const ScatterSettings& scatter) {
++                 int alias_load, bool alias_bitmap, const ScatterSettings& scatter,
++                 size_t click_tasks, ClickWork scan_clicks, ClickFinish finish_clicks) {
+     std::optional<Ids> event_ids(std::in_place, 'e');
+     std::array<int64_t, 8> chunk_ends{};
+     LinkTrace link_trace;
+@@ -1475,8 +1544,7 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+                 size_t size = fields.template field<3>(clock);
+                 ingest = window.ingest_time(View(clock, size));
+             }
+-            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest
+-                                                                  SHOPPING_TIME(, weight));
++            auto event = parse_event<Candidate>(fields, window, catalogs, ids, ingest SHOPPING_TIME(, weight));
+             SHOPPING_TIME(timing::Scope route(timing::Route, weight);)
+             route.append(id & (ingest_buckets - 1), Candidate(id, ingest, event, window));
+         });
+@@ -1486,7 +1554,7 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+     {
+         LinkBuild build(people, links, ids, alias_batch, alias_load, alias_bitmap,
+                         scatter.huge, threads, measure ? &link_trace : nullptr);
+-        std::atomic<size_t> next_event{0};
++        std::atomic<size_t> next_event{0}, next_click{0};
+         parallel(threads, threads, [&](unsigned, size_t worker) {
+             bool finished = false;
+             try {
+@@ -1503,7 +1571,16 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+                         entries[worker]->finish();
+                         finished = true;
+                     }
+-                    if (stage == LinkBuild::Done) return;
++                    if (stage == LinkBuild::Done) {
++                        if (!click_tasks) return;
++                        size_t task = next_click.fetch_add(1, std::memory_order_relaxed);
++                        if (task < click_tasks) {
++                            scan_clicks(worker, task);
++                            continue;
++                        }
++                        finish_clicks(worker);
++                        return;
++                    }
+                     build.wait(stage);
+                 }
+             } catch (...) {
+@@ -1529,6 +1606,7 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+     };
+     std::vector<Table> tables(threads);
+     const unsigned shift = std::countr_zero(buckets);
++    const bool high_tag = setting("SHOPPING_DEDUP_HIGH_TAG", false);
+     auto dedup = [&](unsigned worker, size_t count, auto visit) {
+         if (!count) return;
+         ScatterRoute routing(*records[worker], scatter.prefetch);
+@@ -1570,20 +1648,26 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         positions.assign(slots, 0);
+         size_t mask = slots - 1;
+         constexpr uint32_t index_mask = UINT16_MAX;
+-        visit([&](const Candidate& entry) {
+-            uint64_t hash = entry.id >> shift;
+-            uint32_t tag = uint32_t(hash ^ (hash >> 32)) & ~index_mask;
+-            size_t i = hash & mask;
+-            for (uint32_t pos; (pos = positions[i]); i = (i + 1) & mask) {
+-                if ((pos & ~index_mask) != tag) continue;
+-                auto*& winner = table.winners[(pos & index_mask) - 1];
+-                if (winner->id != entry.id) continue;
+-                if (entry.ingest < winner->ingest) winner = &entry;
+-                return;
+-            }
+-            table.winners.push_back(&entry);
+-            positions[i] = tag | static_cast<uint32_t>(table.winners.size());
+-        });
++        auto index_entries = [&]<bool HighTag> {
++            visit([&](const Candidate& entry) {
++                uint64_t hash = entry.id >> shift;
++                uint32_t tag;
++                if constexpr (HighTag) tag = uint32_t(entry.id >> 32) & ~index_mask;
++                else tag = uint32_t(hash ^ (hash >> 32)) & ~index_mask;
++                size_t i = hash & mask;
++                for (uint32_t pos; (pos = positions[i]); i = (i + 1) & mask) {
++                    if ((pos & ~index_mask) != tag) continue;
++                    auto*& winner = table.winners[(pos & index_mask) - 1];
++                    if (winner->id != entry.id) continue;
++                    if (entry.ingest < winner->ingest) winner = &entry;
++                    return;
++                }
++                table.winners.push_back(&entry);
++                positions[i] = tag | static_cast<uint32_t>(table.winners.size());
++            });
++        };
++        if (high_tag) index_entries.template operator()<true>();
++        else index_entries.template operator()<false>();
+         for (auto* winner : table.winners) emit(*winner);
+         resolved.finish();
+         routing.finish();
+@@ -1601,7 +1685,8 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         if (!count) return;
+         unsigned first_bits = std::countr_zero(ingest_buckets);
+         size_t parts = buckets / ingest_buckets;
+-        Scatter<const Candidate*> split(parts, scatter.huge, scatter.streaming, scatter.staging_lines);
++        Scatter<const Candidate*> split(parts, scatter.huge, scatter.streaming,
++                                        scatter.staging_bytes, scatter.avx, scatter.cursor);
+         ScatterRoute route(split, scatter.prefetch);
+         visit([&](const Candidate& row) { route.append((row.id >> first_bits) & (parts - 1), &row); });
+         route.finish();
+@@ -1622,25 +1707,19 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+ }
+ 
+ template<class Time, class Validate>
+-ScatterWorkers<Click<Time>> read_clicks(const Input& input, unsigned threads, Trace& trace,
+-                                        size_t partitions, const People& people, size_t alias_batch,
+-                                        const ScatterSettings& scatter, Validate validate) {
+-    auto records = scatter_workers<Click<Time>>(threads, partitions, scatter);
+-    parallel(threads, input.chunks.size(), [&](unsigned worker, size_t task) {
+-        ScatterRoute routing(*records[worker], scatter.prefetch);
+-        auto route = [&](const Click<Time>& click) {
+-            routing.append(click.person & (partitions - 1), click);
+-        };
+-        PersonBatch<Click<Time>, decltype(route)> resolved(people, alias_batch, route);
+-        scan_fields<4>(input.chunks[task], [&](const auto& fields) {
+-            const char* id;
+-            if (fields.template field<0>(id)) validate(id, fields, resolved);
+-        });
+-        resolved.finish();
+-        routing.finish();
+-    }, [&](unsigned worker) { records[worker]->finish(); });
+-    trace.mark("click_scan_validation");
+-    return records;
++void scan_click_chunk(View chunk, Scatter<Click<Time>>& records, size_t partitions, const People& people,
++                      size_t alias_batch, size_t prefetch, const Validate& validate) {
++    ScatterRoute routing(records, prefetch);
++    auto route = [&](const Click<Time>& click) {
++        routing.append(click.person & (partitions - 1), click);
++    };
++    PersonBatch<Click<Time>, decltype(route)> resolved(people, alias_batch, route);
++    scan_fields<4>(chunk, [&](const auto& fields) {
++        const char* id;
++        if (fields.template field<0>(id)) validate(id, fields, resolved);
++    });
++    resolved.finish();
++    routing.finish();
+ }
+ 
+ template<class T> class ScratchArray {
+@@ -1679,7 +1758,8 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+                        const ScatterWorkers<PersonEvent<Value>>& sources,
+                        const ScatterWorkers<Click<Time>>& click_sources,
+                        size_t bucket, size_t total, size_t click_count, unsigned partition_bits,
+-                       const Window& window, const BucketLayout& layout, size_t few_clicks = 0) {
++                       const Window& window, const BucketLayout& layout, size_t few_clicks,
++                       bool larger_person_table) {
+     auto& people = result.people;
+     auto& table = result.table;
+     auto& offsets = result.event_offsets;
+@@ -1688,7 +1768,8 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+     using Slot = typename Timelines<Value, Time, Index>::Slot;
+     size_t max_people = Bucketed ? std::min(total, layout.person_limit()) : 768;
+     size_t max_slots = std::max<size_t>(32, std::bit_ceil((max_people * 4 + 2) / 3));
+-    size_t table_size = std::clamp<size_t>(std::bit_ceil(total / 16 + 1), 32, max_slots);
++    size_t estimate = larger_person_table ? total / 8 : total / 16;
++    size_t table_size = std::clamp<size_t>(std::bit_ceil(estimate + 1), 32, max_slots);
+     table.assign(table_size, Slot{});
+     auto find = [partition_bits](auto& slots, Person person) -> Slot& {
+         size_t mask = slots.size() - 1;
+@@ -2205,32 +2286,57 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto staging_lines = number_env("SHOPPING_STAGING_LINES", 1);
+     if (staging_lines != 1 && staging_lines != 2 && staging_lines != 4)
+         throw std::runtime_error("invalid SHOPPING_STAGING_LINES");
++    auto staging_bytes = number_env("SHOPPING_STAGING_BYTES", 0, 0);
++    if (staging_bytes && staging_bytes != 64 && staging_bytes != 128)
++        throw std::runtime_error("invalid SHOPPING_STAGING_BYTES");
++    bool staging_avx = false;
++#if defined(__x86_64__)
++    staging_avx = setting("SHOPPING_STAGING_AVX", true) && scatter_avx_supported();
++#endif
+     ScatterSettings scatter{setting("SHOPPING_HUGE", true), setting("SHOPPING_NT", true),
+-                            static_cast<unsigned>(staging_lines),
+-                            std::min<uint64_t>(max_staging_prefetch, number_env("SHOPPING_STAGING_PREFETCH", 0, 0))};
++                            staging_bytes ? staging_bytes : staging_lines * 64,
++                            std::min<uint64_t>(max_staging_prefetch, number_env("SHOPPING_STAGING_PREFETCH", 0, 0)),
++                            staging_avx, setting("SHOPPING_STAGING_CURSOR", false)};
+     size_t ingest_buckets = setting("SHOPPING_EVENT_TWO_LEVEL", false) ? std::min<size_t>(64, buckets) : buckets;
+     auto entries = scatter_workers<Candidate>(threads, ingest_buckets, scatter);
+     auto events = scatter_workers<Survivor>(threads, partitions, scatter);
+-    read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, ingest_buckets,
+-                events, partitions, alias_batch, alias_load, alias_bitmap, scatter);
+-    if (trace.enabled())
+-        std::fprintf(stderr, "partitions %zu %zu\n", buckets, partitions);
+     using ClickTime = std::conditional_t<std::is_same_v<Candidate, CompactCandidate>, uint32_t, int64_t>;
+-    auto clicks = read_clicks<ClickTime>(click_input, threads, trace, partitions, people, alias_batch, scatter,
+-                                       [&](const char* id, const auto& f, auto& batch) {
++    ScatterWorkers<Click<ClickTime>> clicks;
++    auto validate_click = [&](const char* id, const auto& f, auto& batch) {
+         const char *user, *ts, *campaign_id;
+         size_t user_size = f.template field<1>(user);
+         if (!user_size) return;
+         size_t ts_size = f.template field<3>(ts);
+-        int64_t time = window.event_time(View(ts, ts_size));
+-        if (time < window.start - week_ms || time >= window.end) return;
++        constexpr bool relative = std::is_unsigned_v<ClickTime>;
++        int64_t time = window.event_time<relative>(View(ts, ts_size));
++        if constexpr (relative) {
++            if (time < -week_ms || time >= window.end - window.start) return;
++            time += week_ms;
++        } else {
++            if (time < window.start - week_ms || time >= window.end) return;
++        }
+         size_t campaign_size = f.template field<2>(campaign_id);
+         uint32_t campaign = catalogs.campaign(View(campaign_id, campaign_size));
+         if (!campaign) return;
+         Person person = ids.key(View(user, user_size));
+-        if constexpr (std::is_unsigned_v<ClickTime>) time -= window.start - week_ms;
+         batch.append({person, {id, static_cast<ClickTime>(time), campaign}});
+-    });
++    };
++    auto scan_clicks = [&](unsigned worker, size_t task) {
++        scan_click_chunk(click_input.chunks[task], *clicks[worker], partitions, people,
++                         alias_batch, scatter.prefetch, validate_click);
++    };
++    auto finish_clicks = [&](unsigned worker) { clicks[worker]->finish(); };
++    bool click_ingest = setting("SHOPPING_CLICK_INGEST", false);
++    if (click_ingest) clicks = scatter_workers<Click<ClickTime>>(threads, partitions, scatter);
++    read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, ingest_buckets,
++                events, partitions, alias_batch, alias_load, alias_bitmap, scatter,
++                click_ingest ? click_input.chunks.size() : 0, scan_clicks, finish_clicks);
++    if (trace.enabled()) std::fprintf(stderr, "partitions %zu %zu\n", buckets, partitions);
++    if (!click_ingest) {
++        clicks = scatter_workers<Click<ClickTime>>(threads, partitions, scatter);
++        parallel(threads, click_input.chunks.size(), scan_clicks, finish_clicks);
++    }
++    trace.mark("click_scan_validation");
+ 
+     fs::create_directories(out / "user_daily");
+     fs::create_directories(out / "campaign_daily");
+@@ -2241,6 +2347,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto layout = BucketLayout::for_span(uint64_t(window.end) - uint64_t(window.start));
+     size_t bucket_minimum = number_env("SHOPPING_BUCKET_MIN_EVENTS", 128);
+     size_t few_clicks = number_env("SHOPPING_FEW_CLICKS", 16, 0);
++    bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", false);
+     bool bucket_sessions = layout.count && !setting("SHOPPING_FORCE_SORT", false);
+     auto partition_bits = std::countr_zero(partitions);
+     struct Worker {
+@@ -2277,7 +2384,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+                 GroupTrace::Scope measured{group};
+                 SHOPPING_TIME(timing::Scope group(timing::Group);)
+                 collect_timelines<Bucketed>(state.timelines, events, clicks, bucket, count, click_count,
+-                                            partition_bits, window, layout, few_clicks);
++                                            partition_bits, window, layout, few_clicks, larger_person_table);
+             }
+             SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
+             aggregate<Bucketed>(state.timelines, catalogs, window, state.campaigns, state.users, state.attribution,
+diff --git a/scatter.hpp b/scatter.hpp
+index b16ec8a..f4e166e 100644
+--- a/scatter.hpp
++++ b/scatter.hpp
+@@ -88,12 +88,30 @@ public:
+     }
+ };
+ 
++#if defined(__x86_64__)
++inline bool scatter_avx_supported() {
++    unsigned a, b, c, d;
++    constexpr unsigned required = bit_AVX | bit_OSXSAVE;
++    if (!__get_cpuid(1, &a, &b, &c, &d) || (c & required) != required) return false;
++    unsigned os, high;
++    asm volatile("xgetbv" : "=a"(os), "=d"(high) : "c"(0));
++    return (os & 6) == 6;
++}
++
++[[gnu::target("avx"), gnu::noinline]] inline void stream_128(void* to, const void* from) {
++    auto* destination = static_cast<__m256i*>(to);
++    auto* source = static_cast<const __m256i*>(from);
++    for (size_t i = 0; i < 4; ++i)
++        _mm256_stream_si256(destination + i, _mm256_load_si256(source + i));
++}
++#endif
++
+ template<class T> class Scatter {
+     static constexpr size_t line = 64;
+     static_assert(sizeof(T) <= line && alignof(T) <= line);
++    static_assert(std::is_trivially_copyable_v<T>);
+     static constexpr size_t staging_rows = line / sizeof(T);
+     static constexpr size_t block_lines = sizeof(T) == 16 ? 63 : sizeof(T) == 24 ? 31 : 127;
+-    static constexpr size_t block_rows = staging_rows * block_lines;
+     struct alignas(line) Buffer { T rows[staging_rows]; };
+     struct alignas(line) Block {
+         Block* next;
+@@ -101,26 +119,37 @@ template<class T> class Scatter {
+         Buffer lines[block_lines];
+     };
+     static_assert(sizeof(Block) == line * (block_lines + 1));
+-    struct Stream {
++    struct alignas(32) Stream {
+         Block* head = nullptr;
+         Block* tail = nullptr;
+         size_t count = 0;
+         unsigned used = 0, pending = 0;
+     };
+-    std::unique_ptr<Buffer[]> buffers_;
++    static_assert(sizeof(Stream) == 32);
++    struct alignas(line) Cursors { uintptr_t next[line / sizeof(uintptr_t)]; };
++    static constexpr size_t cursors_per_line = line / sizeof(uintptr_t);
+     std::vector<Stream> streams_;
++    std::unique_ptr<Cursors[]> cursors_;
++    std::unique_ptr<void, decltype(&std::free)> buffers_;
+     ScatterArena arena_;
+-    bool streaming_;
+-    unsigned staging_shift_;
+-    size_t staging_capacity_;
++    size_t staging_bytes_, block_rows_, staging_capacity_;
++    bool streaming_, avx_;
++
++    uintptr_t& cursor(size_t index) {
++        return cursors_[index / cursors_per_line].next[index % cursors_per_line];
++    }
++
++    uintptr_t buffer(size_t index) const {
++        return reinterpret_cast<uintptr_t>(buffers_.get()) + index * staging_bytes_;
++    }
+ 
+     [[gnu::noinline]] void advance(Stream& stream) {
+         auto* block = ::new (arena_.block(sizeof(Block))) Block;
+         block->next = nullptr;
+         if (stream.tail) {
+-            stream.tail->used = block_rows;
++            stream.tail->used = block_rows_;
+             stream.tail->next = block;
+-            stream.count += block_rows;
++            stream.count += block_rows_;
+         } else {
+             stream.head = block;
+         }
+@@ -128,78 +157,145 @@ template<class T> class Scatter {
+         stream.used = 0;
+     }
+ 
+-    void write_line(Stream& stream, Buffer& buffer) {
+-        if (stream.used == block_rows || !stream.tail) advance(stream);
+-        auto* destination = &stream.tail->lines[stream.used / staging_rows];
++    template<bool Cursor> void ensure_space(Stream& stream) {
++        if (stream.used >= block_rows_ || (!Cursor && !stream.tail)) advance(stream);
++    }
++
++    template<bool Cursor> void write_line(Stream& stream, std::byte* source) {
++        ensure_space<Cursor>(stream);
++        auto* destination = stream.tail->lines + stream.used / staging_rows;
+ #if defined(__x86_64__)
+         if (streaming_) {
+             if constexpr (staging_rows * sizeof(T) < line)
+-                std::memset(reinterpret_cast<std::byte*>(&buffer) + staging_rows * sizeof(T), 0,
+-                            line - staging_rows * sizeof(T));
++                std::memset(source + staging_rows * sizeof(T), 0, line - staging_rows * sizeof(T));
+ #if defined(__AVX2__)
+             auto* to = reinterpret_cast<__m256i*>(destination);
+-            auto* from = reinterpret_cast<const __m256i*>(buffer.rows);
++            auto* from = reinterpret_cast<const __m256i*>(source);
+             _mm256_stream_si256(to, _mm256_load_si256(from));
+             _mm256_stream_si256(to + 1, _mm256_load_si256(from + 1));
+ #else
+             auto* to = reinterpret_cast<__m128i*>(destination);
+-            auto* from = reinterpret_cast<const __m128i*>(buffer.rows);
++            auto* from = reinterpret_cast<const __m128i*>(source);
+             for (size_t i = 0; i < line / 16; ++i)
+                 _mm_stream_si128(to + i, _mm_load_si128(from + i));
+ #endif
+         } else
+ #endif
+-            std::memcpy(destination->rows, buffer.rows, staging_rows * sizeof(T));
++            std::memcpy(destination->rows, source, staging_rows * sizeof(T));
+         stream.used += staging_rows;
+     }
+ 
++    template<bool Cursor> void flush(Stream& stream, uintptr_t start) {
++        if (staging_bytes_ == line) {
++            write_line<Cursor>(stream, reinterpret_cast<std::byte*>(start));
++            return;
++        }
++        ensure_space<Cursor>(stream);
++        auto* destination = stream.tail->lines + stream.used / staging_rows;
++        auto* source = reinterpret_cast<std::byte*>(start);
++#if defined(__x86_64__)
++        if (streaming_) {
++            if constexpr (staging_rows * sizeof(T) < line)
++                for (size_t i = 0; i < staging_bytes_; i += line)
++                    std::memset(source + i + staging_rows * sizeof(T), 0, line - staging_rows * sizeof(T));
++            if (staging_bytes_ == 128 && avx_) {
++                stream_128(destination, source);
++            } else {
++                auto* to = reinterpret_cast<__m128i*>(destination);
++                auto* from = reinterpret_cast<const __m128i*>(source);
++                for (size_t i = 0; i < staging_bytes_ / 16; ++i)
++                    _mm_stream_si128(to + i, _mm_load_si128(from + i));
++            }
++        } else
++#endif
++            for (size_t i = 0; i < staging_bytes_ / line; ++i)
++                std::memcpy(destination[i].rows, source + i * line, staging_rows * sizeof(T));
++        stream.used += (staging_bytes_ / line) * staging_rows;
++    }
++
+ public:
+-    Scatter(size_t partitions, bool huge, bool streaming, unsigned staging_lines)
+-        : buffers_(std::make_unique_for_overwrite<Buffer[]>(partitions * staging_lines)), streams_(partitions),
+-          arena_(huge), streaming_(streaming), staging_shift_(std::countr_zero(staging_lines)),
+-          staging_capacity_(staging_rows * staging_lines) {}
++    Scatter(size_t partitions, bool huge, bool streaming, size_t staging_bytes, bool avx, bool use_cursor)
++        : streams_(partitions),
++          cursors_(use_cursor ? std::make_unique_for_overwrite<Cursors[]>(
++              (partitions + cursors_per_line - 1) / cursors_per_line) : nullptr),
++          buffers_(std::aligned_alloc(staging_bytes, partitions * staging_bytes), &std::free),
++          arena_(huge), staging_bytes_(staging_bytes),
++          block_rows_((block_lines & ~(staging_bytes / line - 1)) * staging_rows),
++          staging_capacity_(staging_bytes / line * staging_rows),
++          streaming_(streaming), avx_(avx) {
++        if (!buffers_) throw std::bad_alloc();
++        if (cursors_)
++            for (size_t i = 0; i < partitions; ++i) {
++                cursor(i) = buffer(i);
++                streams_[i].used = std::numeric_limits<unsigned>::max();
++            }
++    }
+ 
+     void prefetch(size_t index) {
+-        auto* buffer = buffers_.get() + (index << staging_shift_);
+-        for (unsigned i = 0; i < (1u << staging_shift_); ++i) __builtin_prefetch(buffer + i, 1, 3);
++        if (cursors_) __builtin_prefetch(&cursor(index), 1, 3);
++        auto start = buffer(index);
++        for (size_t i = 0; i < staging_bytes_; i += line)
++            __builtin_prefetch(reinterpret_cast<void*>(start + i), 1, 3);
+     }
+ 
+     void append(size_t index, const T& row) {
+-        auto& stream = streams_[index];
+-        if (staging_shift_ == 0) {
+-            auto& buffer = buffers_[index];
+-            buffer.rows[stream.pending++] = row;
+-            if (stream.pending == staging_rows) {
+-                write_line(stream, buffer);
+-                stream.pending = 0;
++        if (!cursors_) {
++            auto& stream = streams_[index];
++            if (staging_bytes_ == line) {
++                auto* start = reinterpret_cast<std::byte*>(buffer(index));
++                std::memcpy(start + stream.pending++ * sizeof(T), &row, sizeof(T));
++                if (stream.pending == staging_rows) {
++                    write_line<false>(stream, start);
++                    stream.pending = 0;
++                }
++            } else {
++                auto start = buffer(index);
++                auto pending = stream.pending++;
++                auto offset = pending / staging_rows * line + pending % staging_rows * sizeof(T);
++                std::memcpy(reinterpret_cast<void*>(start + offset), &row, sizeof(T));
++                if (stream.pending == staging_capacity_) {
++                    flush<false>(stream, start);
++                    stream.pending = 0;
++                }
+             }
+             return;
+         }
+-        auto* buffer = buffers_.get() + (index << staging_shift_);
+-        size_t pending = stream.pending++;
+-        buffer[pending / staging_rows].rows[pending % staging_rows] = row;
+-        if (stream.pending != staging_capacity_) return;
+-        for (unsigned i = 0; i < (1u << staging_shift_); ++i) write_line(stream, buffer[i]);
+-        stream.pending = 0;
++        auto& write = cursor(index);
++        uintptr_t next = write + sizeof(T);
++        std::memcpy(reinterpret_cast<void*>(write), &row, sizeof(T));
++        if constexpr (line % sizeof(T) != 0) {
++            if ((next & (line - 1)) + sizeof(T) > line)
++                next = (next + line - 1) & ~(line - 1);
++        }
++        if (!(next & (staging_bytes_ - 1))) {
++            next -= staging_bytes_;
++            flush<true>(streams_[index], next);
++        }
++        write = next;
+     }
+ 
+     void finish() {
+         for (size_t i = 0; i < streams_.size(); ++i) {
+             auto& stream = streams_[i];
+-            if (stream.pending) {
+-                auto* buffer = buffers_.get() + (i << staging_shift_);
+-                for (size_t pending = stream.pending; pending;) {
+-                    if (!stream.tail || stream.used == block_rows) advance(stream);
+-                    auto& destination = stream.tail->lines[stream.used / staging_rows];
+-                    size_t count = std::min(pending, staging_rows);
+-                    std::memcpy(destination.rows, (buffer++)->rows, count * sizeof(T));
++            auto start = buffer(i);
++            size_t bytes = cursors_ ? cursor(i) - start
++                : stream.pending / staging_rows * line + stream.pending % staging_rows * sizeof(T);
++            if (bytes) {
++                if (!stream.tail || stream.used >= block_rows_) advance(stream);
++                auto* destination = stream.tail->lines + stream.used / staging_rows;
++                for (size_t offset = 0; offset < bytes; offset += line) {
++                    size_t count = std::min(bytes - offset, line) / sizeof(T);
++                    std::memcpy(destination->rows, reinterpret_cast<void*>(start + offset), count * sizeof(T));
++                    ++destination;
+                     stream.used += count;
+-                    pending -= count;
+                 }
+-                stream.pending = 0;
++                if (cursors_) cursor(i) = start;
++                else stream.pending = 0;
++            }
++            if (stream.tail) {
++                stream.tail->used = stream.used;
++                stream.count += stream.used;
+             }
+-            if (stream.tail) stream.tail->used = stream.used;
+-            stream.count += stream.used;
+         }
+ #if defined(__x86_64__)
+         if (streaming_) _mm_sfence();
+@@ -252,13 +348,14 @@ public:
+     void finish() { while (first_ != next_) emit(); }
+ };
+ 
+-struct ScatterSettings { bool huge, streaming; unsigned staging_lines; size_t prefetch; };
++struct ScatterSettings { bool huge, streaming; size_t staging_bytes, prefetch; bool avx, cursor; };
+ 
+ template<class T> using ScatterWorkers = std::vector<std::unique_ptr<Scatter<T>>>;
+ 
+ template<class T> ScatterWorkers<T> scatter_workers(unsigned threads, size_t partitions, const ScatterSettings& settings) {
+     ScatterWorkers<T> workers;
+     for (unsigned i = 0; i < threads; ++i)
+-        workers.push_back(std::make_unique<Scatter<T>>(partitions, settings.huge, settings.streaming, settings.staging_lines));
++        workers.push_back(std::make_unique<Scatter<T>>(partitions, settings.huge, settings.streaming,
++                                                       settings.staging_bytes, settings.avx, settings.cursor));
+     return workers;
+ }
