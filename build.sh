@@ -18,11 +18,20 @@ else
     set -- -std=c++20 -O3 -DNDEBUG -pthread -static -flto=1 -s
 fi
 
+# A hanging training step must not hang the build: it fails into the plain build.
+limit() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 10 "${SHOPPING_PGO_TIMEOUT:-120}" "$@"
+    else
+        "$@"
+    fi
+}
+
 profile() (
     scratch=$(mktemp -d "${TMPDIR:-/tmp}/shopping-pgo.XXXXXXXX") || exit 1
     trap 'rm -rf -- "$scratch"' EXIT
     cd "$scratch" || exit 1
-    sh "$source_dir/train-profile.sh" "$scratch/data" || exit 1
+    limit sh "$source_dir/train-profile.sh" "$scratch/data" || exit 1
 
     case "${SHOPPING_PGO:-gcc}" in
         gcc)
@@ -38,7 +47,7 @@ profile() (
         *) exit 1 ;;
     esac
 
-    NCPU=8 LLVM_PROFILE_FILE="$scratch/counts.profraw" \
+    limit env NCPU=8 LLVM_PROFILE_FILE="$scratch/counts.profraw" \
         "${SHOPPING_PROFILE_RUNNER:-env}" ./shopping "$scratch/data" "$scratch/output" || exit 1
     test -s output/user_daily/part-0.parquet && test -s output/campaign_daily/part-0.parquet || exit 1
 
