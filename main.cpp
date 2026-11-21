@@ -127,6 +127,7 @@ template<class Work> void parallel(unsigned threads, size_t tasks, Work work) {
     std::mutex error_mutex;
     std::exception_ptr error;
     auto run = [&](unsigned worker) {
+        SHOPPING_TIME(timing::Local local;)
         try {
             for (size_t task; (task = next.fetch_add(1, std::memory_order_relaxed)) < tasks;)
                 work(worker, task);
@@ -202,6 +203,7 @@ class Trace {
     bool enabled_ = std::getenv("SHOPPING_TRACE") != nullptr;
     int64_t time_ = 0;
     rusage usage_{};
+    SHOPPING_TIME(timing::Hardware hardware_;)
 
     static int64_t micros(timeval t) { return int64_t(t.tv_sec) * 1'000'000 + t.tv_usec; }
 
@@ -228,6 +230,7 @@ public:
             double(cpu) / 1e6, usage.ru_minflt - usage_.ru_minflt, usage.ru_majflt - usage_.ru_majflt);
         time_ = time;
         usage_ = usage;
+        SHOPPING_TIME(hardware_.mark(phase);)
     }
 
 };
@@ -940,7 +943,8 @@ template<class Category> EventValue<Category> unpack(EventValue<Category> value,
 
 template<class Category>
 Event<Category> parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
-                            Ids& ids, int64_t ingest) {
+                            Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
+    SHOPPING_TIME(timing::Scope validation(timing::Validate, weight);)
     if (fields[1].empty() || fields[5].empty() || ingest == bad_time) return {};
     bool purchase = fields[4] == "purchase";
     if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
@@ -948,7 +952,12 @@ Event<Category> parse_event(const Fields<7>& fields, const Window& window, const
     if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
     int64_t price = purchase ? decimal(fields[6], 10'000'000) : 0;
     if (purchase && price <= 0) return {};
-    return {ids.key(fields[1]), {time, static_cast<uint32_t>(price),
+    Person person;
+    {
+        SHOPPING_TIME(timing::Scope hash(timing::PersonHash, weight);)
+        person = ids.key(fields[1]);
+    }
+    return {person, {time, static_cast<uint32_t>(price),
             purchase ? static_cast<Category>(catalogs.category(fields[5])) : 0}};
 }
 
@@ -970,12 +979,24 @@ read_events(const Input& input, unsigned threads, Trace& trace,
             people.emplace(links, ids);
             return;
         }
+        SHOPPING_TIME(timing::Scope scanning(timing::Scan);)
         scan<7>(input.chunks[task - 1], [&](View, const Fields<7>& fields) {
+            SHOPPING_TIME(unsigned weight = timing::sample(256); timing::Scope row(timing::Rows, weight);)
             if (fields[0].empty()) return;
-            uint64_t id = event_ids.key(fields[0]);
-            int64_t ingest = ingest_timestamp(fields[3]);
+            uint64_t id;
+            {
+                SHOPPING_TIME(timing::Scope hash(timing::Hash, weight);)
+                id = event_ids.key(fields[0]);
+            }
+            int64_t ingest;
+            {
+                SHOPPING_TIME(timing::Scope parse(timing::Parse, weight);)
+                ingest = ingest_timestamp(fields[3]);
+            }
             // Keep invalid copies in the same competition for earliest ingest.
-            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest);
+            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest
+                                                                  SHOPPING_TIME(, weight));
+            SHOPPING_TIME(timing::Scope route(timing::Route, weight);)
             entries[worker]->append(id % event_buckets, id, ingest, event, window);
         });
     });
@@ -1044,63 +1065,21 @@ std::vector<Partitions<Click>> read_clicks(const Input& input, unsigned threads,
     return records;
 }
 
-template<class T> struct Rows {
-    std::unique_ptr<T[]> storage;
-    size_t count;
-    std::span<const T> view() const { return {storage.get(), count}; }
-    bool empty() const { return !count; }
-};
-
-
-template<class T, class Less>
-Rows<T> collect_sorted(std::vector<Partitions<T>>& sources, size_t bucket, Less less) {
-    size_t total = 0;
-    for (const auto& batch : sources) total += batch[bucket].size();
-    constexpr unsigned radix_size = 256;
-    auto digit = [](Person person) { return unsigned(person >> 56); };
-    auto result = std::make_unique_for_overwrite<T[]>(std::max<size_t>(1, total));
-    T* begin = result.get();
-    if (total < 512) {
-        T* next = begin;
-        for (auto& batch : sources) {
-            auto& rows = batch[bucket];
-            next = std::copy(rows.begin(), rows.end(), next);
-            std::vector<T>().swap(rows);
-        }
-        std::sort(begin, next, less);
-        return {std::move(result), total};
-    }
-    std::array<size_t, radix_size + 1> offsets{};
-    for (const auto& batch : sources)
-        for (const auto& row : batch[bucket]) ++offsets[digit(row.person) + 1];
-    for (size_t i = 1; i < offsets.size(); ++i) offsets[i] += offsets[i - 1];
-    auto next = offsets;
-    for (auto& batch : sources) {
-        auto& rows = batch[bucket];
-        for (const auto& row : rows) result[next[digit(row.person)]++] = row;
-        std::vector<T>().swap(rows);
-    }
-    for (size_t i = 0; i < radix_size; ++i) {
-        T* first = begin + offsets[i];
-        T* last = begin + offsets[i + 1];
-        std::sort(first, last, less);
-    }
-    return {std::move(result), total};
-}
-
-struct PersonRange { Person person; size_t begin, end; };
+struct PersonRange { Person person; size_t begin, end, click_begin, click_end; };
+struct ClickValue { View id; int64_t time; uint32_t campaign; };
 
 template<class Value> struct Timelines {
     std::vector<PersonRange> people;
     std::unique_ptr<Value[]> values;
+    std::unique_ptr<ClickValue[]> clicks;
 };
 
-template<class Value>
+template<class Index, class Value>
 Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& sources,
-                                   size_t bucket, size_t total) {
+                                   std::vector<Partitions<Click>>& click_sources, size_t bucket, size_t total) {
     Timelines<Value> result;
     auto& people = result.people;
-    struct Slot { Person person = 0; size_t index; };
+    struct Slot { Person person = 0; Index index; };
     std::vector<Slot> table(std::max<size_t>(32, std::bit_ceil(total / 4 + 1)));
     auto find = [](auto& slots, Person person) -> Slot& {
         size_t mask = slots.size() - 1;
@@ -1116,24 +1095,38 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
             for (auto entry : table) if (entry.person) find(grown, entry.person) = entry;
             table.swap(grown);
         }
-        size_t id = people.size();
+        auto id = static_cast<Index>(people.size());
         find(table, person) = {person, id};
-        people.push_back({person, 0, 0});
+        people.push_back({person, 0, 0, 0, 0});
         return id;
     };
 
-    auto local_ids = std::make_unique_for_overwrite<size_t[]>(total);
+    auto local_ids = std::make_unique_for_overwrite<Index[]>(total);
     size_t row_index = 0;
     for (const auto& batch : sources) for (const auto& row : batch[bucket]) {
-        size_t id = index(row.person);
+        Index id = index(row.person);
         local_ids[row_index++] = id;
         ++people[id].end;
     }
-    size_t next = 0;
+    size_t click_count = 0;
+    for (const auto& batch : click_sources) click_count += batch[bucket].size();
+    auto click_ids = std::make_unique_for_overwrite<Index[]>(click_count);
+    constexpr Index absent = std::numeric_limits<Index>::max();
+    row_index = 0;
+    for (const auto& batch : click_sources) for (const auto& row : batch[bucket]) {
+        auto& slot = find(table, row.person);
+        click_ids[row_index++] = slot.person ? slot.index : absent;
+        if (slot.person) ++people[slot.index].click_end;
+    }
+
+    size_t next = 0, next_click = 0;
     for (auto& range : people) {
         range.begin = next;
         next += range.end;
         range.end = range.begin;
+        range.click_begin = next_click;
+        next_click += range.click_end;
+        range.click_end = range.click_begin;
     }
     result.values = std::make_unique_for_overwrite<Value[]>(total);
     row_index = 0;
@@ -1143,7 +1136,18 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
             result.values[people[local_ids[row_index++]].end++] = row.value;
         std::vector<PersonEvent<Value>>().swap(rows);
     }
+    result.clicks = std::make_unique_for_overwrite<ClickValue[]>(next_click);
+    row_index = 0;
+    for (auto& batch : click_sources) {
+        auto& rows = batch[bucket];
+        for (const auto& row : rows) {
+            Index id = click_ids[row_index++];
+            if (id != absent) result.clicks[people[id].click_end++] = {row.id, row.time, row.campaign};
+        }
+        std::vector<Click>().swap(rows);
+    }
     auto* values = result.values.get();
+    auto* clicks = result.clicks.get();
     for (auto range : people) {
         if constexpr (std::is_same_v<Value, uint64_t>) {
             std::sort(values + range.begin, values + range.end);
@@ -1151,9 +1155,12 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
             std::sort(values + range.begin, values + range.end,
                       [](const Value& a, const Value& b) { return a.time < b.time; });
         }
+        if (range.click_end - range.click_begin > 1)
+            std::sort(clicks + range.click_begin, clicks + range.click_end,
+                      [](const ClickValue& a, const ClickValue& b) {
+                          return a.time == b.time ? a.id > b.id : a.time < b.time;
+                      });
     }
-    std::sort(people.begin(), people.end(),
-              [](const auto& a, const auto& b) { return a.person < b.person; });
     return result;
 }
 
@@ -1211,7 +1218,7 @@ public:
 
 template<class Value, class Category>
 void aggregate(const Timelines<Value>& timelines,
-               std::span<const Click> clicks, const Catalogs& catalogs, const Window& window,
+               const Catalogs& catalogs, const Window& window,
                CampaignTotals& totals, std::vector<UserDaily<Category>>& users) {
     constexpr bool sparse_categories = std::is_same_v<Category, size_t>;
     std::conditional_t<sparse_categories, std::unordered_map<Category, int64_t>, std::vector<int64_t>> spend;
@@ -1219,12 +1226,10 @@ void aggregate(const Timelines<Value>& timelines,
     std::vector<Category> bought;
     std::vector<size_t> counts(catalogs.campaigns.size());
     std::vector<uint32_t> positions(counts.size()), active;
-    size_t click = 0;
+    const auto* clicks = timelines.clicks.get();
     auto at = [&](size_t event) { return unpack(timelines.values[event], window); };
-    for (auto [person, event, end] : timelines.people) {
-        while (click < clicks.size() && clicks[click].person < person) ++click;
-        size_t begin = click;
-        while (click < clicks.size() && clicks[click].person == person) ++click;
+    for (auto [person, event, end, begin, click] : timelines.people) {
+        SHOPPING_TIME(unsigned weight = timing::sample(64);)
         size_t first = begin, last = begin;
         do {
             int32_t day = utc_day(at(event).time);
@@ -1247,6 +1252,7 @@ void aggregate(const Timelines<Value>& timelines,
                 ++daily.sessions;
                 daily.revenue += revenue;
 
+                SHOPPING_TIME(timing::Scope attribution(timing::Attribution, weight);)
                 const int64_t lower = start - week_ms;
                 while (first < last && clicks[first].time < lower) {
                     uint32_t campaign = clicks[first++].campaign;
@@ -1345,6 +1351,7 @@ void write_users(parquet::File& file, std::span<const UserDaily<Category>> users
 }
 
 void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs) {
+    SHOPPING_TIME(timing::Scope encode(timing::Encode);)
     using parquet::little_endian;
     using parquet::plain;
     std::vector<std::pair<uint64_t, const CampaignDaily*>> rows;
@@ -1422,14 +1429,19 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
     parallel(threads, partition_count, [&](unsigned worker, size_t task) {
         size_t bucket = jobs[task];
         if (!event_counts[bucket]) return;
-        auto ev = collect_timelines(events, bucket, event_counts[bucket]);
-        auto cl = collect_sorted(clicks, bucket, [](const Click& a, const Click& b) {
-            if (a.person != b.person) return a.person < b.person;
-            return a.time == b.time ? a.id > b.id : a.time < b.time;
-        });
+        auto ev = [&] {
+            SHOPPING_TIME(timing::Scope group(timing::Group);)
+            if (event_counts[bucket] <= UINT32_MAX)
+                return collect_timelines<uint32_t>(events, clicks, bucket, event_counts[bucket]);
+            return collect_timelines<size_t>(events, clicks, bucket, event_counts[bucket]);
+        }();
         using Category = typename Candidate::Category;
         std::vector<UserDaily<Category>> users;
-        aggregate(ev, cl.view(), catalogs, window, campaign_totals[worker], users);
+        {
+            SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
+            aggregate(ev, catalogs, window, campaign_totals[worker], users);
+        }
+        SHOPPING_TIME(timing::Scope encode(timing::Encode);)
         auto& writer = writers[worker];
         if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
             ("part-" + std::to_string(worker) + ".parquet"), user_schema);
@@ -1441,6 +1453,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
         writers[0] = std::make_unique<parquet::File>(out / "user_daily" / "part-0.parquet", user_schema);
     parallel(threads, threads + 1, [&](unsigned, size_t task) {
         if (task) {
+            SHOPPING_TIME(timing::Scope encode(timing::Encode);)
             if (auto& file = writers[task - 1]) file->finish();
             return;
         }
@@ -1449,6 +1462,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
         write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
     });
     trace.mark("finish");
+    SHOPPING_TIME(timing::report();)
     // Same code in the profiling and the final build: the profile writers are
     // weak symbols that exist only when the binary is instrumented.
     if (__gcov_dump) __gcov_dump();

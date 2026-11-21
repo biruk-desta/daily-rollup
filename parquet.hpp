@@ -1,5 +1,7 @@
 #pragma once
 
+#include "detail_trace.hpp"
+
 #include <algorithm>
 #include <bit>
 #include <cstdint>
@@ -99,6 +101,7 @@ class File {
     Bytes page_;
 
     void write(const void* data, size_t size) {
+        SHOPPING_TIME(timing::Scope writing(timing::Write);)
         if (size && std::fwrite(data, 1, size, file_) != size)
             throw std::runtime_error("Parquet write failed");
         offset_ += size;
@@ -146,7 +149,9 @@ class File {
 
 public:
     File(const std::filesystem::path& path, std::span<const Column> schema)
-        : file_(std::fopen(path.c_str(), "wb")), schema_(schema) {
+        : schema_(schema) {
+        SHOPPING_TIME(timing::Scope writing(timing::Write);)
+        file_ = std::fopen(path.c_str(), "wb");
         if (!file_) throw std::runtime_error("cannot open " + path.string());
         if (std::fwrite("PAR1", 1, 4, file_) != 4) {
             std::fclose(file_);
@@ -210,6 +215,7 @@ public:
         little_endian(footer, size);
         write(footer);
         write("PAR1", 4);
+        SHOPPING_TIME(timing::Scope close(timing::Write);)
         int error = std::fclose(file_);
         file_ = nullptr;
         if (error) throw std::runtime_error("Parquet close failed");
