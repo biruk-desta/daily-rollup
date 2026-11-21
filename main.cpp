@@ -682,6 +682,11 @@ public:
 class People {
     struct Alias { Person key = 0, value = 0; };
     std::vector<Alias> aliases_ = std::vector<Alias>(32);
+    std::vector<uint64_t> has_alias_;
+
+    size_t alias_bit(Person key) const {
+        return (key >> 12) & (has_alias_.size() * 64 - 1);
+    }
 
     static size_t slot(const std::vector<Alias>& aliases, Person key) {
         size_t mask = aliases.size() - 1;
@@ -729,10 +734,19 @@ public:
                 members[a].key = members[b].key;
             }
         });
-        for (auto& alias : aliases_) if (alias.key) alias.value = members[root(alias.value)].key;
+        has_alias_.resize(std::max<size_t>(1, aliases_.size() / 8));
+        for (auto& alias : aliases_) if (alias.key) {
+            alias.value = members[root(alias.value)].key;
+            if (alias.key != alias.value) {
+                size_t bit = alias_bit(alias.key);
+                has_alias_[bit / 64] |= uint64_t{1} << (bit % 64);
+            }
+        }
     }
 
     Person name(Person key) const {
+        size_t bit = alias_bit(key);
+        if (!(has_alias_[bit / 64] & (uint64_t{1} << (bit % 64)))) return key;
         auto value = aliases_[slot(aliases_, key)].value;
         return value ? value : key;
     }
