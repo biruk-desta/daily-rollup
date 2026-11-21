@@ -5,7 +5,6 @@
 #include <atomic>
 #include <charconv>
 #include <cstdlib>
-#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -33,7 +32,7 @@ constexpr int64_t week_ms = 7 * day_ms;
 constexpr int64_t gap_ms = 1'800'000;
 constexpr int64_t bad_time = INT64_MIN;
 constexpr unsigned partition_count = 128;
-constexpr uint32_t no_category = UINT32_MAX;
+template<class Category> constexpr Category no_category = std::numeric_limits<Category>::max();
 
 struct Hash {
     size_t operator()(View s) const noexcept {
@@ -609,7 +608,8 @@ class Ids {
     struct Shard {
         std::mutex lock;
         StringMap<uint32_t> indices;
-        std::deque<std::string> names;
+        // Fields point into input mappings that outlive this index.
+        std::vector<View> names;
         size_t longest = 0;
     };
     std::array<Shard, 64> shards_;
@@ -650,8 +650,8 @@ public:
             if (position == shard.indices.end()) {
                 if (shard.names.size() > UINT32_MAX) throw std::runtime_error("too many distinct IDs");
                 auto number = static_cast<uint32_t>(shard.names.size());
-                shard.names.emplace_back(bytes);
-                position = shard.indices.emplace(shard.names.back(), number).first;
+                shard.names.push_back(bytes);
+                position = shard.indices.emplace(bytes, number).first;
                 shard.longest = std::max(shard.longest, bytes.size());
             }
             value = external | (uint64_t(index) << 32) | position->second;
@@ -681,6 +681,7 @@ public:
 
 class People {
     struct Alias { Person key = 0, value = 0; };
+    struct MemberIndexOverflow {};
     std::vector<Alias> aliases_ = std::vector<Alias>(32);
     std::vector<uint64_t> has_alias_;
 
@@ -695,14 +696,15 @@ class People {
         return i;
     }
 
-public:
-    People(const Input& links, Ids& ids) {
-        struct Member { View name; Person key; uint32_t parent, size; };
+    template<class Index> void build(const Input& links, Ids& ids) {
+        struct Member { View name; Person key; Index parent, size; };
         std::vector<Member> members;
         auto add = [&](View name) {
             Person key = ids.key(name);
             size_t i = slot(aliases_, key);
-            if (aliases_[i].key) return uint32_t(aliases_[i].value);
+            if (aliases_[i].key) return static_cast<Index>(aliases_[i].value);
+            // The largest possible component must also fit in Index.
+            if (members.size() == std::numeric_limits<Index>::max()) throw MemberIndexOverflow{};
             if ((members.size() + 1) * 4 > aliases_.size() * 3) {
                 std::vector<Alias> grown(aliases_.size() * 2);
                 for (const auto& alias : aliases_)
@@ -710,12 +712,12 @@ public:
                 aliases_.swap(grown);
                 i = slot(aliases_, key);
             }
-            auto index = static_cast<uint32_t>(members.size());
+            auto index = static_cast<Index>(members.size());
             aliases_[i] = {key, index};
             members.push_back({name, key, index, 1});
             return index;
         };
-        auto root = [&](uint32_t i) {
+        auto root = [&](Index i) {
             while (i != members[i].parent) {
                 members[i].parent = members[members[i].parent].parent;
                 i = members[i].parent;
@@ -724,7 +726,7 @@ public:
         };
         for (View chunk : links.chunks) scan<2>(chunk, [&](View, const Fields<2>& fields) {
             if (fields[0].empty() || fields[1].empty()) return;
-            uint32_t a = root(add(fields[0])), b = root(add(fields[1]));
+            Index a = root(add(fields[0])), b = root(add(fields[1]));
             if (a == b) return;
             if (members[a].size < members[b].size) std::swap(a, b);
             members[b].parent = a;
@@ -744,6 +746,16 @@ public:
         }
     }
 
+public:
+    People(const Input& links, Ids& ids) {
+        try {
+            build<uint32_t>(links, ids);
+        } catch (const MemberIndexOverflow&) {
+            aliases_ = std::vector<Alias>(32);
+            build<size_t>(links, ids);
+        }
+    }
+
     Person name(Person key) const {
         size_t bit = alias_bit(key);
         if (!(has_alias_[bit / 64] & (uint64_t{1} << (bit % 64)))) return key;
@@ -754,12 +766,13 @@ public:
 
 
 struct Catalogs {
-    StringMap<uint32_t> products, campaign_ids;
+    StringMap<size_t> products;
+    StringMap<uint32_t> campaign_ids;
     std::vector<View> categories{"unknown"};
     std::vector<View> campaigns{"organic"}, channels{"organic"};
 
     Catalogs(const Input& product_input, const Input& campaign_input) {
-        StringMap<uint32_t> category_ids;
+        StringMap<size_t> category_ids;
         for (View chunk : product_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
             auto [where, inserted] = category_ids.try_emplace(f[1], categories.size());
             if (inserted) categories.push_back(f[1]);
@@ -771,15 +784,15 @@ struct Catalogs {
             channels.push_back(f[1]);
         });
     }
-    uint32_t category(View product) const {
+    size_t category(View product) const {
         auto result = products.find(product);
         return result == products.end() ? 0 : result->second;
     }
 };
 
-struct EventValue { int64_t time; uint32_t price, category; };
+template<class Category> struct EventValue { int64_t time; uint32_t price; Category category; };
 template<class Value> struct PersonEvent { Person person; Value value; };
-using Event = PersonEvent<EventValue>;
+template<class Category> using Event = PersonEvent<EventValue<Category>>;
 using CompactEvent = PersonEvent<uint64_t>;
 struct Click { Person person; View id; int64_t time; uint32_t campaign; };
 
@@ -793,24 +806,26 @@ bool compact_events(const Window& window, const Catalogs& catalogs) {
 
 struct CompactCandidate {
     using Survivor = CompactEvent;
+    using Category = uint32_t;
     uint64_t id;
     int64_t ingest;
     CompactEvent payload;
 
-    CompactCandidate(uint64_t id, int64_t ingest, Event event, const Window& window)
+    CompactCandidate(uint64_t id, int64_t ingest, Event<Category> event, const Window& window)
         : id(id), ingest(ingest), payload{event.person, event.person
             ? uint64_t(event.value.time - window.start) << 32 |
               uint64_t(event.value.category) << 24 | event.value.price
             : 0} {}
 };
 
-struct WideCandidate {
-    using Survivor = Event;
+template<class Index> struct WideCandidate {
+    using Category = Index;
+    using Survivor = Event<Category>;
     uint64_t id;
     int64_t ingest;
-    Event payload;
+    Survivor payload;
 
-    WideCandidate(uint64_t id, int64_t ingest, Event event, const Window&)
+    WideCandidate(uint64_t id, int64_t ingest, Survivor event, const Window&)
         : id(id), ingest(ingest), payload(event) {}
 
 };
@@ -861,7 +876,8 @@ public:
     CandidateArena& operator=(const CandidateArena&) = delete;
     ~CandidateArena() { if (rows_) munmap(rows_, bytes_); }
 
-    void append(size_t index, uint64_t id, int64_t ingest, Event event, const Window& window) {
+    void append(size_t index, uint64_t id, int64_t ingest, Event<typename Candidate::Category> event,
+                const Window& window) {
         auto& bucket = buckets_[index];
         if (bucket.used < capacity_)
             std::construct_at(rows_ + index * capacity_ + bucket.used++, id, ingest, event, window);
@@ -881,14 +897,17 @@ public:
     }
 };
 
-EventValue unpack(uint64_t value, const Window& window) {
+EventValue<uint32_t> unpack(uint64_t value, const Window& window) {
     return {window.start + int64_t(value >> 32), uint32_t(value) & price_mask, uint32_t(value) >> 24};
 }
 
-EventValue unpack(EventValue value, const Window&) { return value; }
+template<class Category> EventValue<Category> unpack(EventValue<Category> value, const Window&) {
+    return value;
+}
 
-Event parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
-                  Ids& ids, int64_t ingest) {
+template<class Category>
+Event<Category> parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
+                            Ids& ids, int64_t ingest) {
     if (fields[1].empty() || fields[5].empty() || ingest == bad_time) return {};
     bool purchase = fields[4] == "purchase";
     if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
@@ -897,7 +916,7 @@ Event parse_event(const Fields<7>& fields, const Window& window, const Catalogs&
     int64_t price = purchase ? decimal(fields[6], 10'000'000) : 0;
     if (purchase && price <= 0) return {};
     return {ids.key(fields[1]), {time, static_cast<uint32_t>(price),
-            purchase ? catalogs.category(fields[5]) : 0}};
+            purchase ? static_cast<Category>(catalogs.category(fields[5])) : 0}};
 }
 
 template<class Candidate>
@@ -923,7 +942,7 @@ read_events(const Input& input, unsigned threads, Trace& trace,
             uint64_t id = event_ids.key(fields[0]);
             int64_t ingest = ingest_timestamp(fields[3]);
             // Keep invalid copies in the same competition for earliest ingest.
-            Event event = parse_event(fields, window, catalogs, ids, ingest);
+            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest);
             entries[worker]->append(id % event_buckets, id, ingest, event, window);
         });
     });
@@ -1105,10 +1124,10 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
     return result;
 }
 
-struct UserDaily {
+template<class Category> struct UserDaily {
     Person user;
     int32_t day;
-    uint32_t category;
+    Category category;
     int64_t sessions = 0, events = 0, revenue = 0;
 };
 struct CampaignDaily { int64_t sessions = 0, purchases = 0, revenue = 0, assists = 0; };
@@ -1157,12 +1176,14 @@ public:
     }
 };
 
-template<class Value>
+template<class Value, class Category>
 void aggregate(const Timelines<Value>& timelines,
                std::span<const Click> clicks, const Catalogs& catalogs, const Window& window,
-               CampaignTotals& totals, std::vector<UserDaily>& users) {
-    std::vector<int64_t> spend(catalogs.categories.size());
-    std::vector<uint32_t> bought;
+               CampaignTotals& totals, std::vector<UserDaily<Category>>& users) {
+    constexpr bool sparse_categories = std::is_same_v<Category, size_t>;
+    std::conditional_t<sparse_categories, std::unordered_map<Category, int64_t>, std::vector<int64_t>> spend;
+    if constexpr (!sparse_categories) spend.resize(catalogs.categories.size());
+    std::vector<Category> bought;
     std::vector<size_t> counts(catalogs.campaigns.size());
     std::vector<uint32_t> positions(counts.size()), active;
     size_t click = 0;
@@ -1174,7 +1195,7 @@ void aggregate(const Timelines<Value>& timelines,
         size_t first = begin, last = begin;
         do {
             int32_t day = utc_day(at(event).time);
-            UserDaily daily{person, day, no_category};
+            UserDaily<Category> daily{person, day, no_category<Category>};
             auto* day_campaigns = totals.day(day);
             do {
                 int64_t start = at(event).time;
@@ -1184,8 +1205,9 @@ void aggregate(const Timelines<Value>& timelines,
                     previous = row.time;
                     ++daily.events;
                     if (row.price) {
-                        if (!spend[row.category]) bought.push_back(row.category);
-                        spend[row.category] += row.price;
+                        auto& category_spend = spend[row.category];
+                        if (!category_spend) bought.push_back(row.category);
+                        category_spend += row.price;
                         revenue += row.price;
                     }
                 } while (event < end && uint64_t(at(event).time) - uint64_t(previous) <= gap_ms);
@@ -1225,14 +1247,15 @@ void aggregate(const Timelines<Value>& timelines,
             } while (event < end && utc_day(at(event).time) == day);
 
             int64_t high = 0;
-            for (uint32_t category : bought) {
+            for (Category category : bought) {
                 int64_t revenue = spend[category];
                 if (revenue > high || (revenue == high &&
                     catalogs.categories[category] < catalogs.categories[daily.category])) {
                     daily.category = category;
                     high = revenue;
                 }
-                spend[category] = 0;
+                if constexpr (sparse_categories) spend.erase(category);
+                else spend[category] = 0;
             }
             bought.clear();
             users.push_back(daily);
@@ -1256,7 +1279,8 @@ size_t longest_string(const std::vector<View>& strings) {
     return length;
 }
 
-void write_users(parquet::File& file, std::span<const UserDaily> users, const Catalogs& catalogs,
+template<class Category>
+void write_users(parquet::File& file, std::span<const UserDaily<Category>> users, const Catalogs& catalogs,
                  const Ids& ids, size_t group_rows) {
     using parquet::little_endian;
     using parquet::plain;
@@ -1264,7 +1288,7 @@ void write_users(parquet::File& file, std::span<const UserDaily> users, const Ca
         auto group = users.first(std::min(group_rows, users.size()));
         file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
             if (column == 5) parquet::definitions(bytes, group.size(), [&](size_t i) {
-                return group[i].category != no_category;
+                return group[i].category != no_category<Category>;
             });
             for (const auto& row : group) {
                 switch (column) {
@@ -1277,7 +1301,9 @@ void write_users(parquet::File& file, std::span<const UserDaily> users, const Ca
                     case 2: little_endian(bytes, row.sessions); break;
                     case 3: little_endian(bytes, row.events); break;
                     case 4: little_endian(bytes, row.revenue); break;
-                    case 5: if (row.category != no_category) plain(bytes, catalogs.categories[row.category]); break;
+                    case 5:
+                        if (row.category != no_category<Category>) plain(bytes, catalogs.categories[row.category]);
+                        break;
                 }
             }
         });
@@ -1385,12 +1411,13 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
             if (a.person != b.person) return a.person < b.person;
             return a.time == b.time ? a.id > b.id : a.time < b.time;
         });
-        std::vector<UserDaily> users;
+        using Category = typename Candidate::Category;
+        std::vector<UserDaily<Category>> users;
         aggregate(ev, cl.view(), catalogs, window, campaign_totals[worker], users);
         auto& writer = writers[worker];
         if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
             ("part-" + std::to_string(worker) + ".parquet"), user_schema);
-        write_users(*writer, users, catalogs, ids, user_group_rows);
+        write_users<Category>(*writer, users, catalogs, ids, user_group_rows);
     });
     trace.mark("sessions_user_output");
 
@@ -1422,8 +1449,10 @@ int main(int argc, char** argv) try {
     const Catalogs catalogs(products, campaigns);
     if (compact_events(window, catalogs))
         process<CompactCandidate>(window, links, catalogs, event_input, click_input, out, threads, trace);
+    else if (catalogs.categories.size() <= no_category<uint32_t>)
+        process<WideCandidate<uint32_t>>(window, links, catalogs, event_input, click_input, out, threads, trace);
     else
-        process<WideCandidate>(window, links, catalogs, event_input, click_input, out, threads, trace);
+        process<WideCandidate<size_t>>(window, links, catalogs, event_input, click_input, out, threads, trace);
 } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());
     return 1;
