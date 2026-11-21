@@ -1,0 +1,11 @@
+# Round 5 scorer probe
+
+The `probe` entry point runs once on the public development input. It finishes by incrementing one `user_daily.events` cell and writing both Parquet tables. The expected rejection shows one differing user row and the probe's stderr. The three production candidate branches start from `b15008f` independently.
+
+`main.cpp`, `parquet.hpp`, `build.sh` and `train-profile.sh` are byte-identical to `b15008f`. The image builds that exact engine as `/shopping`. It also builds `/shopping-tuned` from a diagnostic copy with four switches and `/shopping-read` from the buffered-read candidate patch. Each uses the original GCC PGO build with the same training workload and fallback.
+
+The five files in `probe-generator` match `generator/src/` in the kit's `generator.zip` byte for byte. The image compiles the original source as a standalone, statically linked Rust binary. Seed `20261120` requests 20M events and 5M clicks, including the kit's own row lengths, duplicate and alias generation, and size-skewed parts. A failed or 32-second generation attempt can fall back to 5M/1.25M. `R5 gen` prints the sizes actually requested. All data generation and pipeline jobs run sequentially with at most eight threads each.
+
+`R5 <variant> n=<runs> <scanner> <wall ms> [start/maps/prefault/ingest+links/dedup+route/clicks/sessions+user output/finish/exit ms] <peak MiB> f=<minor>/<major>` gives medians of fresh processes. `n=3` is a complete result. The whole diagnostic budget is 132 seconds, with time reserved to write the development tables and exit before 150 seconds.
+
+`cache` shows sampled resident and opaque pages. Linux may mask residency for read-only files owned by another UID. `io` gives the first page-touch time and warm median for `/data` and its `/scratch` copy, plus first-touch major faults. The copy is already buffered by construction. The median `O_DIRECT` read gives a cache-bypassing comparison when the filesystem supports it. `NA` marks unavailable measurements. The probe leaves kernel page-cache policy alone. `write` measures opening, writing and closing the same in-memory Parquet bytes on `/output` without an `fsync`.
