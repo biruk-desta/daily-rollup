@@ -919,8 +919,24 @@ public:
 struct Catalogs {
     StringMap<size_t> products;
     StringMap<uint32_t> campaign_ids;
+    std::vector<uint32_t> numbered_campaigns;
     std::vector<View> categories{"unknown"};
     std::vector<View> campaigns{"organic"}, channels{"organic"};
+
+    static int campaign_number(View s) {
+        if (s.size() < 3 || s.size() > 6 || !s.starts_with("c_")) return -1;
+        if (s.size() == 3) {
+            unsigned digit = uint8_t(s[2]) - unsigned('0');
+            return digit <= 9 ? static_cast<int>(digit) : -1;
+        }
+        if (s[2] == '0') return -1;
+        uint32_t word;
+        std::memcpy(&word, s.data() + s.size() - 4, 4);
+        word = (word ^ 0x30303030U) & (UINT32_MAX << (8 * (6 - s.size())));
+        if ((word | (word + 0x06060606U)) & 0xf0f0f0f0U) return -1;
+        uint32_t pairs = (word * 10 + (word >> 8)) & 0x00ff00ffU;
+        return (pairs & 255) * 100 + (pairs >> 16);
+    }
 
     Catalogs(const Input& product_input, const Input& campaign_input) {
         StringMap<size_t> category_ids;
@@ -931,6 +947,10 @@ struct Catalogs {
         });
         for (View chunk : campaign_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
             campaign_ids.emplace(f[0], campaigns.size());
+            if (int number = campaign_number(f[0]); number >= 0) {
+                if (size_t limit = number + 1; limit > numbered_campaigns.size()) numbered_campaigns.resize(limit);
+                numbered_campaigns[number] = campaigns.size();
+            }
             campaigns.push_back(f[0]);
             channels.push_back(f[1]);
         });
@@ -939,19 +959,38 @@ struct Catalogs {
         auto result = products.find(product);
         return result == products.end() ? 0 : result->second;
     }
+
+    uint32_t campaign(View id) const {
+        unsigned number = campaign_number(id);
+        if (number < numbered_campaigns.size()) return numbered_campaigns[number];
+        auto result = campaign_ids.find(id);
+        return result == campaign_ids.end() ? 0 : result->second;
+    }
 };
 
 template<class Category> struct EventValue { int64_t time; uint32_t price; Category category; };
 template<class Value> struct PersonEvent { Person person; Value value; };
 template<class Category> using Event = PersonEvent<EventValue<Category>>;
 using CompactEvent = PersonEvent<uint64_t>;
-struct Click { Person person; View id; int64_t time; uint32_t campaign; };
+template<class Time> struct ClickValue { const char* id; Time time; uint32_t campaign; };
+template<class Time> using Click = PersonEvent<ClickValue<Time>>;
+
+// The initial field of a validated row ends at its closing quote or comma.
+// Walk those bytes only on a timestamp tie and compare as unsigned bytes.
+bool click_id_after(const char* a, const char* b) {
+    for (;;) {
+        uint8_t left = *a++, right = *b++;
+        bool left_end = left == ',' || left == '"', right_end = right == ',' || right == '"';
+        if (left_end || right_end) return right_end && !left_end;
+        if (left != right) return left > right;
+    }
+}
 
 constexpr unsigned event_buckets = 256;
 constexpr uint32_t price_mask = (1u << 24) - 1;
 
 bool compact_events(const Window& window, const Catalogs& catalogs) {
-    return uint64_t(window.end) - uint64_t(window.start) <= UINT32_MAX &&
+    return uint64_t(window.end) - uint64_t(window.start) <= UINT32_MAX - week_ms &&
            catalogs.categories.size() <= 256;
 }
 
@@ -1166,12 +1205,12 @@ read_events(const Input& input, unsigned threads, Trace& trace,
     return records;
 }
 
-template<class Validate>
-std::vector<Partitions<Click>> read_clicks(const Input& input, unsigned threads, Trace& trace,
-                                          Validate validate) {
+template<class Time, class Validate>
+std::vector<Partitions<Click<Time>>> read_clicks(const Input& input, unsigned threads, Trace& trace,
+                                               Validate validate) {
     // Identical click copies have the same winner ordering and contribute one
     // active campaign regardless of their multiplicity.
-    std::vector<Partitions<Click>> records(threads);
+    std::vector<Partitions<Click<Time>>> records(threads);
     parallel(threads, input.chunks.size(), [&](unsigned worker, size_t task) {
         scan<4>(input.chunks[task], [&](View, const Fields<4>& fields) {
             if (!fields[0].empty()) validate(fields, records[worker]);
@@ -1182,18 +1221,18 @@ std::vector<Partitions<Click>> read_clicks(const Input& input, unsigned threads,
 }
 
 struct PersonRange { Person person; size_t begin, end, click_begin, click_end; };
-struct ClickValue { View id; int64_t time; uint32_t campaign; };
 
-template<class Value> struct Timelines {
+template<class Value, class Time> struct Timelines {
     std::vector<PersonRange> people;
     std::unique_ptr<Value[]> values;
-    std::unique_ptr<ClickValue[]> clicks;
+    std::unique_ptr<ClickValue<Time>[]> clicks;
 };
 
-template<class Index, class Value>
-Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& sources,
-                                   std::vector<Partitions<Click>>& click_sources, size_t bucket, size_t total) {
-    Timelines<Value> result;
+template<class Index, class Value, class Time>
+Timelines<Value, Time> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& sources,
+                                         std::vector<Partitions<Click<Time>>>& click_sources,
+                                         size_t bucket, size_t total) {
+    Timelines<Value, Time> result;
     auto& people = result.people;
     struct Slot { Person person = 0; Index index; };
     std::vector<Slot> table(std::max<size_t>(32, std::bit_ceil(total / 4 + 1)));
@@ -1252,15 +1291,15 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
             result.values[people[local_ids[row_index++]].end++] = row.value;
         std::vector<PersonEvent<Value>>().swap(rows);
     }
-    result.clicks = std::make_unique_for_overwrite<ClickValue[]>(next_click);
+    result.clicks = std::make_unique_for_overwrite<ClickValue<Time>[]>(next_click);
     row_index = 0;
     for (auto& batch : click_sources) {
         auto& rows = batch[bucket];
         for (const auto& row : rows) {
             Index id = click_ids[row_index++];
-            if (id != absent) result.clicks[people[id].click_end++] = {row.id, row.time, row.campaign};
+            if (id != absent) result.clicks[people[id].click_end++] = row.value;
         }
-        std::vector<Click>().swap(rows);
+        std::vector<Click<Time>>().swap(rows);
     }
     auto* values = result.values.get();
     auto* clicks = result.clicks.get();
@@ -1273,8 +1312,8 @@ Timelines<Value> collect_timelines(std::vector<Partitions<PersonEvent<Value>>>& 
         }
         if (range.click_end - range.click_begin > 1)
             std::sort(clicks + range.click_begin, clicks + range.click_end,
-                      [](const ClickValue& a, const ClickValue& b) {
-                          return a.time == b.time ? a.id > b.id : a.time < b.time;
+                      [](const auto& a, const auto& b) {
+                          return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
                       });
     }
     return result;
@@ -1332,8 +1371,8 @@ public:
     }
 };
 
-template<class Value, class Category>
-void aggregate(const Timelines<Value>& timelines,
+template<class Value, class Time, class Category>
+void aggregate(const Timelines<Value, Time>& timelines,
                const Catalogs& catalogs, const Window& window,
                CampaignTotals& totals, std::vector<UserDaily<Category>>& users) {
     constexpr bool sparse_categories = std::is_same_v<Category, size_t>;
@@ -1369,7 +1408,8 @@ void aggregate(const Timelines<Value>& timelines,
                 daily.revenue += revenue;
 
                 SHOPPING_TIME(timing::Scope attribution(timing::Attribution, weight);)
-                const int64_t lower = start - week_ms;
+                const int64_t click_start = std::is_unsigned_v<Time> ? start - (window.start - week_ms) : start;
+                const int64_t lower = click_start - week_ms;
                 while (first < last && clicks[first].time < lower) {
                     uint32_t campaign = clicks[first++].campaign;
                     if (--counts[campaign] == 0) {
@@ -1379,7 +1419,7 @@ void aggregate(const Timelines<Value>& timelines,
                         active.pop_back();
                     }
                 }
-                while (last < click && clicks[last].time <= start) {
+                while (last < click && clicks[last].time <= click_start) {
                     uint32_t campaign = clicks[last].campaign;
                     if (clicks[last++].time < lower) {
                         ++first;
@@ -1517,14 +1557,17 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
     Ids ids('u');
     std::optional<People> people;
     auto events = read_events<Candidate>(event_input, threads, trace, window, catalogs, links, ids, people);
-    auto clicks = read_clicks(click_input, threads, trace, [&](const Fields<4>& f, auto& partitions) {
+    using ClickTime = std::conditional_t<std::is_same_v<Candidate, CompactCandidate>, uint32_t, int64_t>;
+    auto clicks = read_clicks<ClickTime>(click_input, threads, trace, [&](const Fields<4>& f, auto& partitions) {
         if (f[1].empty()) return;
         int64_t time = window.event_time(f[3]);
         if (time < window.start - week_ms || time >= window.end) return;
-        auto campaign = catalogs.campaign_ids.find(f[2]);
-        if (campaign == catalogs.campaign_ids.end()) return;
+        uint32_t campaign = catalogs.campaign(f[2]);
+        if (!campaign) return;
         Person person = people->name(ids.key(f[1]));
-        partitions[person % partition_count].push_back({person, f[0], time, campaign->second});
+        if constexpr (std::is_unsigned_v<ClickTime>) time -= window.start - week_ms;
+        partitions[person % partition_count].push_back({person, {f[0].data(), static_cast<ClickTime>(time),
+                                                                campaign}});
     });
 
     fs::create_directories(out / "user_daily");
