@@ -1433,7 +1433,12 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
         write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
     });
     trace.mark("finish");
+#if defined(SHOPPING_PROFILE_GENERATE)
+    // The compiler's profile writer is registered with atexit.
+    std::exit(0);
+#else
     _exit(0);
+#endif
 }
 
 int main(int argc, char** argv) try {
