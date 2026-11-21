@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <memory>
@@ -459,6 +460,37 @@ int64_t timestamp(View s) {
     return int64_t(days) * day_ms + ((h * 60 + minute - offset) * 60 + second) * 1000;
 }
 
+int64_t epoch_millis_13(const char* p) {
+    uint64_t first;
+    uint32_t next;
+    std::memcpy(&first, p, sizeof(first));
+    std::memcpy(&next, p + sizeof(first), sizeof(next));
+    unsigned last = uint8_t(p[12]) - unsigned('0');
+    first ^= 0x3030303030303030ULL;
+    next ^= 0x30303030U;
+    if (((first | (first + 0x0606060606060606ULL) | next | (next + 0x06060606U)) &
+         0xf0f0f0f0f0f0f0f0ULL) || last > 9) return bad_time;
+    auto four = [](uint64_t digits) {
+        uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+        return (pairs * 100 + (pairs >> 16)) & 0x0000ffff0000ffffULL;
+    };
+    uint64_t groups = four(first);
+    uint64_t first_eight = uint32_t(groups) * 10000 + (groups >> 32);
+    return first_eight * 100000 + four(next) * 10 + last;
+}
+
+int clock_seconds(const char* p) {
+    uint64_t word;
+    std::memcpy(&word, p, sizeof(word));
+    // The two colons must match exactly. Validate all six digits together.
+    word ^= 0x30303a30303a3030ULL;
+    if ((word | (word + 0x0606000606000606ULL)) & 0xf0f0fff0f0fff0f0ULL) return -1;
+    uint64_t pairs = word * 10 + (word >> 8);
+    unsigned h = uint8_t(pairs), m = uint8_t(pairs >> 24), s = uint8_t(pairs >> 48);
+    if ((h > 23) | (m > 59) | (s > 59)) return -1;
+    return h * 3600 + m * 60 + s;
+}
+
 int64_t ingest_timestamp(View s) {
     // Ingest is F1 by contract. Use the same calendar with unchecked clock digits.
     if (s.size() != 20) return bad_time;
@@ -632,6 +664,29 @@ public:
 };
 
 struct Window {
+private:
+    struct Date { uint64_t prefix; uint32_t suffix; int32_t day; };
+    std::array<Date, 64> dates_{};
+
+    static size_t date_slot(const char* s) {
+        return ((uint8_t(s[6]) & 1) << 5) | ((uint8_t(s[8]) * 10 + uint8_t(s[9])) & 31);
+    }
+
+    static Date date_key(const char* s) {
+        Date result{};
+        std::memcpy(&result.prefix, s, 8);
+        std::memcpy(&result.suffix, s + 8, 3);
+        return result;
+    }
+
+    const Date* cached_date(const char* s) const {
+        auto key = date_key(s);
+        const auto& entry = dates_[date_slot(s)];
+        return entry.prefix && ((entry.prefix ^ key.prefix) | (entry.suffix ^ key.suffix)) == 0
+            ? &entry : nullptr;
+    }
+
+public:
     int64_t start, end;
     explicit Window(const fs::path& path) {
         Mapping file(path);
@@ -640,6 +695,40 @@ struct Window {
         end = timestamp(fields[1]);
         if (start == bad_time || end == bad_time || start >= end)
             throw std::runtime_error("invalid manifest window");
+        if (start < int64_t(years[1].days + 9) * day_ms ||
+            end > int64_t(years[9999].days + 350) * day_ms ||
+            uint64_t(end) - uint64_t(start) > 32 * day_ms) return;
+        using namespace std::chrono;
+        for (int32_t day = utc_day(start) - 8; day <= utc_day(end - 1) + 3; ++day) {
+            year_month_day date{sys_days{days{day}}};
+            char key[12];
+            std::snprintf(key, sizeof(key), "%04d-%02u-%02uT", int(date.year()),
+                          unsigned(date.month()), unsigned(date.day()));
+            auto& entry = dates_[date_slot(key)];
+            entry = date_key(key);
+            entry.day = day;
+        }
+    }
+
+    int64_t event_time(View text) const {
+        if (text.size() == 13) return epoch_millis_13(text.data());
+        if (text.size() == 20 && text[19] == 'Z') {
+            if (auto* date = cached_date(text.data())) {
+                int seconds = clock_seconds(text.data() + 11);
+                return seconds < 0 ? bad_time : int64_t(date->day) * day_ms + seconds * 1000;
+            }
+        }
+        return timestamp(text);
+    }
+
+    int64_t ingest_time(View text) const {
+        if (text.size() == 20) {
+            if (auto* date = cached_date(text.data())) {
+                int seconds = clock_seconds(text.data() + 11);
+                if (seconds >= 0) return int64_t(date->day) * day_ms + seconds * 1000;
+            }
+        }
+        return ingest_timestamp(text);
     }
 };
 
@@ -957,7 +1046,7 @@ Event<Category> parse_event(const Fields<7>& fields, const Window& window, const
     if (fields[1].empty() || fields[5].empty() || ingest == bad_time) return {};
     bool purchase = fields[4] == "purchase";
     if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
-    int64_t time = timestamp(fields[2]);
+    int64_t time = window.event_time(fields[2]);
     if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
     int64_t price = purchase ? decimal(fields[6], 10'000'000) : 0;
     if (purchase && price <= 0) return {};
@@ -1000,7 +1089,7 @@ read_events(const Input& input, unsigned threads, Trace& trace,
             int64_t ingest;
             {
                 SHOPPING_TIME(timing::Scope parse(timing::Parse, weight);)
-                ingest = ingest_timestamp(fields[3]);
+                ingest = window.ingest_time(fields[3]);
             }
             // Keep invalid copies in the same competition for earliest ingest.
             auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest
@@ -1412,7 +1501,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
     auto events = read_events<Candidate>(event_input, threads, trace, window, catalogs, links, ids, people);
     auto clicks = read_clicks(click_input, threads, trace, [&](const Fields<4>& f, auto& partitions) {
         if (f[1].empty()) return;
-        int64_t time = timestamp(f[3]);
+        int64_t time = window.event_time(f[3]);
         if (time < window.start - week_ms || time >= window.end) return;
         auto campaign = catalogs.campaign_ids.find(f[2]);
         if (campaign == catalogs.campaign_ids.end()) return;
