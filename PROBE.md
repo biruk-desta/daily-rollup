@@ -1,6 +1,6 @@
 # Round 5 scorer probe
 
-The `probe` entry point runs once on the public development input. It finishes by incrementing one `user_daily.events` cell and writing both Parquet tables. The expected rejection shows one differing user row and the probe's stderr. The three production candidate branches start from `b15008f` independently.
+The `probe` entry point runs once on the public development input. It finishes by writing the exact development tables with the shipped engine and adds seven report rows in `user_daily/!r5.parquet`. Their user IDs start with `!00` to `!06`, so they sort first; each carries a plain-ASCII payload in `user_id` and `top_category` and three numbers in `sessions`, `events` and `revenue_cents`. Row 6 repeats row 0. The rejection page shows differing rows, not stderr; stderr still prints every line. The three production candidate branches start from `b15008f` independently.
 
 `main.cpp`, `parquet.hpp`, `build.sh` and `train-profile.sh` are byte-identical to `b15008f`. The image builds that exact engine as `/shopping`. It also builds `/shopping-tuned` from a diagnostic copy with four switches and `/shopping-read` from the buffered-read candidate patch. Each uses the original GCC PGO build with the same training workload and fallback.
 

@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cstdarg>
+#include <map>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -28,6 +30,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "parquet.hpp"
+
 namespace fs = std::filesystem;
 using Strings = std::vector<std::string>;
 using Ns = int64_t;
@@ -38,6 +42,21 @@ Ns now() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * second + ts.tv_nsec;
+}
+
+std::vector<std::string> report_lines;
+
+// Every R5 line goes to stderr at once and is kept for the report rows.
+void say(const char* format, ...) {
+    char buffer[2048];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    std::fputs(buffer, stderr);
+    std::string line(buffer);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+    if (!line.empty()) report_lines.push_back(line);
 }
 
 double ms(Ns elapsed) { return double(elapsed) / 1'000'000; }
@@ -125,7 +144,7 @@ void show_mount(const std::vector<Mount>& all, const char* label, const fs::path
     for (const auto& m : all)
         if (below(absolute, m.at) && (!best || m.at.size() >= best->at.size())) best = &m;
     if (!best) return;
-    std::fprintf(stderr, "R5 mount %s %s %s;%s\n", label, best->type.c_str(), best->flags.c_str(),
+    say("R5 mount %s %s %s;%s\n", label, best->type.c_str(), best->flags.c_str(),
                  best->super.substr(0, 140).c_str());
 }
 
@@ -164,14 +183,14 @@ void machine(const fs::path& data, const fs::path& scratch, const fs::path& outp
     auto flags = field("/proc/cpuinfo", "flags");
     utsname kernel{};
     uname(&kernel);
-    std::fprintf(stderr, "R5 cpu=%s avx2/bw/vl=%d/%d/%d online=%s affinity=%s(%s) page=%ld kernel=%s\n",
+    say("R5 cpu=%s avx2/bw/vl=%d/%d/%d online=%s affinity=%s(%s) page=%ld kernel=%s\n",
                  field("/proc/cpuinfo", "model name").c_str(), word(flags, "avx2"), word(flags, "avx512bw"),
                  word(flags, "avx512vl"), one_line(contents("/sys/devices/system/cpu/online")).c_str(),
                  field("/proc/self/status", "Cpus_allowed_list").c_str(),
                  field("/proc/self/status", "Cpus_allowed").c_str(), sysconf(_SC_PAGESIZE), kernel.release);
     auto cpu = limit(all, "cpu", "cpu.max", "cpu.cfs_quota_us", "cpu.cfs_period_us");
     auto memory = limit(all, "memory", "memory.max", "memory.limit_in_bytes");
-    std::fprintf(stderr, "R5 cg cpu=%s mem=%s thp=%s defrag=%s\n", cpu.c_str(), memory.c_str(),
+    say("R5 cg cpu=%s mem=%s thp=%s defrag=%s\n", cpu.c_str(), memory.c_str(),
                  one_line(contents("/sys/kernel/mm/transparent_hugepage/enabled")).c_str(),
                  one_line(contents("/sys/kernel/mm/transparent_hugepage/defrag")).c_str());
     show_mount(all, "data", data);
@@ -200,6 +219,8 @@ std::vector<fs::path> files(const fs::path& directory) {
     std::sort(result.begin(), result.end());
     return result;
 }
+
+long cache_resident = -1, cache_sampled = -1;
 
 void cache(const char* label, const fs::path& dir) {
     size_t page = sysconf(_SC_PAGESIZE), sampled = 0, resident = 0, opaque = 0;
@@ -232,7 +253,8 @@ void cache(const char* label, const fs::path& dir) {
         }
         munmap(mapped, bytes);
     }
-    std::fprintf(stderr, "R5 cache %s %zu/%zu opaque=%zu\n", label, resident, sampled, opaque);
+    if (std::string_view(label) == "data-initial") cache_resident = resident, cache_sampled = sampled;
+    say("R5 cache %s %zu/%zu opaque=%zu\n", label, resident, sampled, opaque);
 }
 
 template<class Work> void parallel(unsigned threads, size_t jobs, Work work) {
@@ -436,6 +458,8 @@ std::string show(double value) {
     return text;
 }
 
+double io_first = -1, io_warm = -1;
+
 void input_io(const std::string& self, const fs::path& data, const fs::path& work, Ns deadline) {
     fs::path copy = work / "dev-copy";
     auto read_trial = [&](const fs::path& source, const char* mode, const fs::path& target) {
@@ -446,7 +470,7 @@ void input_io(const std::string& self, const fs::path& data, const fs::path& wor
     auto data_first = read_trial(data, "touch", {});
     auto copied = read_trial(data, "copy", copy);
     if (!copied.ok()) {
-        std::fprintf(stderr, "R5 io data first=%sms major=%ld; copy failed %d\n",
+        say("R5 io data first=%sms major=%ld; copy failed %d\n",
                      show(time(data_first)).c_str(), data_first.usage.ru_majflt, copied.status);
         return;
     }
@@ -463,7 +487,9 @@ void input_io(const std::string& self, const fs::path& data, const fs::path& wor
     };
     double data_warm = readings(data, "touch"), copy_warm = readings(copy, "touch");
     double data_direct = readings(data, "direct"), copy_direct = readings(copy, "direct");
-    std::fprintf(stderr, "R5 io touch/warm/direct ms data=%s/%s/%s scratch=%s/%s/%s first_major=%ld/%ld\n",
+    io_first = time(data_first);
+    io_warm = data_warm;
+    say("R5 io touch/warm/direct ms data=%s/%s/%s scratch=%s/%s/%s first_major=%ld/%ld\n",
                  show(time(data_first)).c_str(), show(data_warm).c_str(), show(data_direct).c_str(),
                  show(time(copy_first)).c_str(), show(copy_warm).c_str(), show(copy_direct).c_str(),
                  data_first.usage.ru_majflt, copy_first.usage.ru_majflt);
@@ -508,6 +534,21 @@ Sample sample(const Child& child) {
     return result;
 }
 
+struct Result {
+    size_t n = 0;
+    std::string scanner, stop;
+    double total = -1;
+    std::array<double, 9> phases{};
+    long rss = -1, minor = -1, major = -1;
+};
+std::map<std::string, Result> results;
+
+std::string fixed(double value) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%.0f", value);
+    return text;
+}
+
 struct Variant {
     const char* name;
     const std::string& engine;
@@ -524,7 +565,9 @@ bool measure(const Variant& v, const fs::path& data, Ns deadline) {
                          std::min(deadline, now() + 14 * second), v.threads, v.flag);
         auto trial = sample(child);
         if (!child.ok() || trial.scanner.empty() || (v.scanner && trial.scanner != v.scanner)) {
-            std::fprintf(stderr, "R5 %s sample=%u stop=%d %s\n", v.name, i + 1, child.status,
+            results[v.name].stop = "s" + std::to_string(i + 1) + ":" + std::to_string(child.status) + ":" +
+                one_line(child.log).substr(0, 60);
+            say("R5 %s sample=%u stop=%d %s\n", v.name, i + 1, child.status,
                          one_line(child.log).substr(0, 140).c_str());
             break;
         }
@@ -537,13 +580,144 @@ bool measure(const Variant& v, const fs::path& data, Ns deadline) {
         for (const auto& s : samples) values.push_back(get(s));
         return median(values);
     };
-    std::fprintf(stderr, "R5 %s n=%zu %s %.1f [", v.name, samples.size(), samples.front().scanner.c_str(),
-                 middle([](const auto& s) { return s.total; }));
-    for (size_t i = 0; i < samples.front().phases.size(); ++i)
-        std::fprintf(stderr, "%s%.1f", i ? "/" : "", middle([i](const auto& s) { return s.phases[i]; }));
-    std::fprintf(stderr, "] %ldMiB f=%ld/%ld\n", middle([](const auto& s) { return s.rss; }),
-                 middle([](const auto& s) { return s.minor; }), middle([](const auto& s) { return s.major; }));
+    Result& r = results[v.name];
+    r.n = samples.size();
+    r.scanner = samples.front().scanner;
+    r.total = middle([](const auto& s) { return s.total; });
+    for (size_t i = 0; i < r.phases.size(); ++i) r.phases[i] = middle([i](const auto& s) { return s.phases[i]; });
+    r.rss = middle([](const auto& s) { return s.rss; });
+    r.minor = middle([](const auto& s) { return s.minor; });
+    r.major = middle([](const auto& s) { return s.major; });
+    std::string line = "R5 " + std::string(v.name) + " n=" + std::to_string(r.n) + " " + r.scanner + " " +
+        fixed(r.total) + " [";
+    for (size_t i = 0; i < r.phases.size(); ++i) line += (i ? "/" : "") + fixed(r.phases[i]);
+    line += "] " + std::to_string(r.rss) + "MiB f=" + std::to_string(r.minor) + "/" + std::to_string(r.major);
+    say("%s\n", line.c_str());
     return samples.size() == 3;
+}
+
+// Plain ASCII without quotes, commas or backslashes survives CSV and JSON display.
+std::string printable(std::string text) {
+    std::string result;
+    for (char c : text) {
+        auto u = static_cast<unsigned char>(c);
+        if (u < 32 || u > 126) c = ' ';
+        else if (c == ',') c = ';';
+        else if (c == '"' || c == '\'' || c == '\\') c = '_';
+        if (c == ' ' && !result.empty() && result.back() == ' ') continue;
+        result += c;
+    }
+    return result;
+}
+
+std::string lines_with(std::initializer_list<std::string_view> keys) {
+    std::string text;
+    for (const auto& line : report_lines) {
+        std::string_view body = line;
+        if (body.starts_with("R5 ")) body.remove_prefix(3);
+        for (auto key : keys)
+            if (body.find(key) != std::string_view::npos) {
+                text += (text.empty() ? "" : " | ") + std::string(body);
+                break;
+            }
+    }
+    return text;
+}
+
+int64_t whole(double value) { return value < 0 ? -1 : static_cast<int64_t>(value + 0.5); }
+
+void write_report(const fs::path& path, double elapsed) {
+    struct Row { std::string text; int64_t a, b, c; };
+    auto total = [](const char* name) -> double {
+        auto it = results.find(name);
+        return it == results.end() ? -1 : it->second.total;
+    };
+    std::vector<Row> rows;
+    auto flags = field("/proc/cpuinfo", "flags");
+    long cpus = long(std::thread::hardware_concurrency());
+    {
+        std::string text = "shipped ";
+        auto it = results.find("shipped");
+        if (it != results.end()) {
+            const auto& r = it->second;
+            text += "ms=" + fixed(r.total) + " " + r.scanner + " n=" + std::to_string(r.n) + " st/map/pf/ing/dd/clk/ses/fin/exit=";
+            for (size_t i = 0; i < r.phases.size(); ++i) text += (i ? "/" : "") + fixed(r.phases[i]);
+            if (!r.stop.empty()) text += " stop=" + r.stop;
+        } else {
+            text += "NA";
+        }
+        text += " threads=" + std::to_string(cpus) + " ncpu=" + env("NCPU", "?") + " " + lines_with({"gen "});
+        auto r = it == results.end() ? Result{} : it->second;
+        rows.push_back({text, whole(r.total), whole(r.phases[3]), whole(r.phases[6])});
+    }
+    {
+        std::string text = "variants ms";
+        for (const char* name : {"t4", "avx2", "avx512", "read", "populate", "prefault", "thpoff", "scratch", "shipped"}) {
+            auto it = results.find(name);
+            text += std::string(" ") + name + "=";
+            if (it == results.end()) text += "NA";
+            else {
+                text += fixed(it->second.total) + "/" + std::to_string(it->second.n);
+                if (!it->second.stop.empty()) text += "/stop";
+            }
+        }
+        rows.push_back({text, whole(total("read")), whole(total("t4")), whole(total("avx512"))});
+    }
+    {
+        std::string text;
+        for (const char* name : {"shipped", "read"}) {
+            auto it = results.find(name);
+            if (it == results.end()) { text += std::string(name) + "=NA "; continue; }
+            text += std::string(name) + " f=" + std::to_string(it->second.minor) + "/" +
+                std::to_string(it->second.major) + " mem=" + std::to_string(it->second.rss) + "MiB ";
+        }
+        text += lines_with({"micro "});
+        auto shipped = results.count("shipped") ? results["shipped"] : Result{};
+        auto read = results.count("read") ? results["read"] : Result{};
+        rows.push_back({text, shipped.rss, read.rss, shipped.major});
+    }
+    rows.push_back({lines_with({"cpu=", "cg "}), cpus, word(flags, "avx512bw"), sysconf(_SC_PAGESIZE)});
+    rows.push_back({lines_with({"cache ", "io "}) + " | " + lines_with({"mount "}), cache_resident, cache_sampled, whole(io_first)});
+    {
+        std::string text = "elapsed=" + fixed(elapsed) + "ms " +
+            lines_with({"write n=", "stop", "unsupported", "unavailable", "failed", "budget"});
+        int64_t problems = 0;
+        for (const auto& line : report_lines)
+            for (std::string_view key : {"stop", "unavailable", "failed", "budget"})
+                if (line.find(key) != std::string::npos) { ++problems; break; }
+        rows.push_back({text, whole(elapsed), whole(io_warm), problems});
+    }
+    rows.push_back(rows.front());
+
+    std::vector<std::string> ids, categories;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        char tag[8];
+        std::snprintf(tag, sizeof(tag), "!%02zu ", i);
+        std::string text = printable(rows[i].text);
+        ids.push_back(tag + text.substr(0, 160));
+        categories.push_back(text.size() > 160 ? text.substr(160, 600) : std::string("-"));
+        say("R5 row %s | %s | %lld %lld %lld\n", ids.back().c_str(), categories.back().c_str(),
+            static_cast<long long>(rows[i].a), static_cast<long long>(rows[i].b), static_cast<long long>(rows[i].c));
+    }
+    static constexpr parquet::Column schema[] = {{"user_id", parquet::Column::Text, 0},
+        {"day", parquet::Column::Int32, 6}, {"sessions", parquet::Column::Int64},
+        {"events", parquet::Column::Int64}, {"revenue_cents", parquet::Column::Int64},
+        {"top_category", parquet::Column::Text, 0, true}};
+    parquet::File file(path, schema);
+    file.append(int32_t(rows.size()), [&](size_t column, parquet::Bytes& bytes) {
+        if (column == 5) parquet::definitions(bytes, rows.size(), [](size_t) { return true; });
+        for (size_t i = 0; i < rows.size(); ++i) {
+            switch (column) {
+                case 0: parquet::plain(bytes, ids[i]); break;
+                case 1: parquet::little_endian(bytes, int32_t(10957 + i)); break;
+                case 2: parquet::little_endian(bytes, rows[i].a); break;
+                case 3: parquet::little_endian(bytes, rows[i].b); break;
+                case 4: parquet::little_endian(bytes, rows[i].c); break;
+                case 5: parquet::plain(bytes, categories[i]); break;
+            }
+        }
+    });
+    file.finish();
 }
 
 int main(int argc, char** argv) try {
@@ -572,8 +746,8 @@ int main(int argc, char** argv) try {
         output_trial = output / ("." + fs::path(temp).filename().string());
         input_io(self, data, work, std::min(deadline, now() + 11 * second));
         auto bench = run({self, "--micro"}, std::min(deadline, now() + 7 * second));
-        if (bench.ok()) std::fputs(bench.log.c_str(), stderr);
-        else std::fprintf(stderr, "R5 micro unavailable (%d)\n", bench.status);
+        if (bench.ok()) say("%s", bench.log.c_str());
+        else say("R5 micro unavailable (%d)\n", bench.status);
         unsigned long long events = std::clamp(std::stoull(env("R5_EVENTS", "20000000")), 1000ULL, 20'000'000ULL);
         auto generate = [&](unsigned long long count, int seconds) {
             return run({generator, "--seed", "20261120", "--events", std::to_string(count), "--clicks",
@@ -587,7 +761,7 @@ int main(int argc, char** argv) try {
             generated = generate(events, 15);
         }
         if (!generated.ok()) throw std::runtime_error("generator failed " + one_line(generated.log).substr(0, 140));
-        std::fprintf(stderr, "R5 gen events=%llu clicks=%llu seed=20261120 ms=%.0f\n", events, events / 4,
+        say("R5 gen events=%llu clicks=%llu seed=20261120 ms=%.0f\n", events, events / 4,
                      generated.elapsed);
 
         fs::path shipped = output_trial / "shipped";
@@ -604,7 +778,7 @@ int main(int argc, char** argv) try {
                 if (!(replay.ok() && (std::istringstream(replay.log) >> bytes >> time))) break;
                 writes.push_back(time);
             }
-            if (!writes.empty()) std::fprintf(stderr, "R5 write n=%zu %.1fms %zuB\n", writes.size(),
+            if (!writes.empty()) say("R5 write n=%zu %.1fms %zuB\n", writes.size(),
                                                median(writes), bytes);
         }
 
@@ -619,30 +793,32 @@ int main(int argc, char** argv) try {
         };
         for (const auto& variant : variants) {
             if (variant.scanner && !word(flags, std::string_view(variant.name) == "avx2" ? "avx2" : "avx512bw")) {
-                std::fprintf(stderr, "R5 %s unsupported\n", variant.name);
+                say("R5 %s unsupported\n", variant.name);
                 continue;
             }
             if (now() + 2 * second > deadline) {
-                std::fprintf(stderr, "R5 budget stopped before %s\n", variant.name);
+                say("R5 budget stopped before %s\n", variant.name);
                 break;
             }
             measure(variant, synth, deadline);
         }
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "R5 diagnostics stopped: %.180s\n", error.what());
+        say("R5 diagnostics stopped: %.180s\n", error.what());
     }
 
     if (!output_trial.empty())
         run({self, "--clean", output_trial.string()}, std::min(start + 135 * second, now() + 3 * second));
-    auto wrong = run({tuned, data.string(), output.string()}, start + 148 * second, 8, "R5_WRONG_ROW");
-    if (!wrong.ok()) {
-        std::fprintf(stderr, "R5 dev output failed (%d): %.180s\n", wrong.status, wrong.log.c_str());
+    // The shipped engine writes the exact dev tables; the report rides in extra rows.
+    auto right = run({normal, data.string(), output.string()}, start + 148 * second, 8);
+    if (!right.ok()) {
+        say("R5 dev output failed (%d): %.180s\n", right.status, right.log.c_str());
         return 1;
     }
-    std::fprintf(stderr, "R5 deliberately changed one dev user_daily.events cell; %.2fs elapsed\n",
-                 double(now() - start) / second);
+    double elapsed = ms(now() - start);
+    say("R5 exact dev tables written; report rows follow; %.2fs elapsed\n", elapsed / 1000);
+    write_report(output / "user_daily" / "!r5.parquet", elapsed);
     return 0;
 } catch (const std::exception& error) {
-    std::fprintf(stderr, "R5 %s\n", error.what());
+    say("R5 %s\n", error.what());
     return 1;
 }
