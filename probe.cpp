@@ -183,9 +183,10 @@ void machine(const fs::path& data, const fs::path& scratch, const fs::path& outp
     auto flags = field("/proc/cpuinfo", "flags");
     utsname kernel{};
     uname(&kernel);
-    say("R5 cpu=%s avx2/bw/vl=%d/%d/%d online=%s affinity=%s(%s) page=%ld kernel=%s\n",
+    say("R5 cpu=%s avx2/bw/vl=%d/%d/%d vbmi2/vbmi/ifma/vnni/bmi2=%d/%d/%d/%d/%d online=%s affinity=%s(%s) page=%ld kernel=%s\n",
                  field("/proc/cpuinfo", "model name").c_str(), word(flags, "avx2"), word(flags, "avx512bw"),
-                 word(flags, "avx512vl"), one_line(contents("/sys/devices/system/cpu/online")).c_str(),
+                 word(flags, "avx512vl"), word(flags, "avx512_vbmi2"), word(flags, "avx512vbmi"),
+                 word(flags, "avx512ifma"), word(flags, "avx512_vnni"), word(flags, "bmi2"), one_line(contents("/sys/devices/system/cpu/online")).c_str(),
                  field("/proc/self/status", "Cpus_allowed_list").c_str(),
                  field("/proc/self/status", "Cpus_allowed").c_str(), sysconf(_SC_PAGESIZE), kernel.release);
     auto cpu = limit(all, "cpu", "cpu.max", "cpu.cfs_quota_us", "cpu.cfs_period_us");
@@ -652,7 +653,7 @@ void write_report(const fs::path& path, double elapsed) {
     }
     {
         std::string text = "variants ms";
-        for (const char* name : {"t4", "avx2", "avx512", "read", "populate", "prefault", "thpoff", "scratch", "shipped"}) {
+        for (const char* name : {"new", "t4", "avx2", "avx512", "read", "populate", "prefault", "thpoff", "scratch", "shipped"}) {
             auto it = results.find(name);
             text += std::string(" ") + name + "=";
             if (it == results.end()) text += "NA";
@@ -661,7 +662,7 @@ void write_report(const fs::path& path, double elapsed) {
                 if (!it->second.stop.empty()) text += "/stop";
             }
         }
-        rows.push_back({text, whole(total("read")), whole(total("t4")), whole(total("avx512"))});
+        rows.push_back({text, whole(total("new")), whole(total("read")), whole(total("avx512"))});
     }
     {
         std::string text;
@@ -676,7 +677,7 @@ void write_report(const fs::path& path, double elapsed) {
         auto read = results.count("read") ? results["read"] : Result{};
         rows.push_back({text, shipped.rss, read.rss, shipped.major});
     }
-    rows.push_back({lines_with({"cpu=", "cg "}), cpus, word(flags, "avx512bw"), sysconf(_SC_PAGESIZE)});
+    rows.push_back({lines_with({"cpu=", "cg "}), cpus, word(flags, "avx512_vbmi2"), word(flags, "avx512bw")});
     rows.push_back({lines_with({"cache ", "io "}) + " | " + lines_with({"mount "}), cache_resident, cache_sampled, whole(io_first)});
     {
         std::string text = "elapsed=" + fixed(elapsed) + "ms " +
@@ -735,6 +736,7 @@ int main(int argc, char** argv) try {
     fs::path data = env("DATA_DIR", "/data"), output = env("OUTPUT_DIR", "/output");
     fs::path scratch = env("SCRATCH_DIR", "/scratch");
     std::string normal = env("R5_NORMAL", "/shopping"), tuned = env("R5_TUNED", "/shopping-tuned");
+    std::string new_engine = env("R5_NEW_ENGINE", "/shopping-new");
     std::string read_engine = env("R5_READ_ENGINE", "/shopping-read"), generator = env("R5_GENERATOR", "/generate");
     fs::path output_trial;
     try {
@@ -766,6 +768,8 @@ int main(int argc, char** argv) try {
 
         fs::path shipped = output_trial / "shipped";
         measure({"shipped", normal, 8, shipped}, synth, deadline);
+        // Candidate 48ddd03 with shipped settings, early so the budget never cuts it.
+        measure({"new", new_engine, 8, output_trial / "new"}, synth, deadline);
         measure({"scratch", normal, 8, local_out}, synth, deadline);
         if (fs::exists(local_out / "0")) {
             std::vector<double> writes;
