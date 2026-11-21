@@ -1124,9 +1124,9 @@ read_events(const Input& input, unsigned threads, Trace& trace,
         if (!count) return;
         // Equal IDs share a slot. Collisions can only add candidates to exact deduplication.
         size_t filter_size = std::max<size_t>(64, std::bit_ceil(count * 8));
-        std::vector<uint64_t> seen(filter_size / 64), repeated(filter_size / 64);
+        std::vector<uint64_t> seen(filter_size / 32);
         auto filter_slot = [&](uint64_t id) { return (id / event_buckets) & (filter_size - 1); };
-        size_t candidates = 0;
+        size_t collisions = 0;
         auto visit = [&](auto use) {
             for (const auto& batch : entries)
                 for (auto block : batch->blocks(bucket))
@@ -1134,11 +1134,11 @@ read_events(const Input& input, unsigned threads, Trace& trace,
         };
         visit([&](const Candidate& entry) {
             size_t i = filter_slot(entry.id);
-            uint64_t bit = uint64_t{1} << (i % 64);
-            bool collision = seen[i / 64] & bit;
-            candidates += collision + (collision && !(repeated[i / 64] & bit));
-            repeated[i / 64] |= seen[i / 64] & bit;
-            seen[i / 64] |= bit;
+            uint64_t bit = uint64_t{1} << (2 * (i % 32));
+            auto& word = seen[i / 32];
+            uint64_t was_seen = word & bit;
+            word |= bit | (was_seen << 1);
+            collisions += was_seen != 0;
         });
         auto emit = [&](const Candidate& entry) {
             auto event = entry.payload;
@@ -1146,11 +1146,12 @@ read_events(const Input& input, unsigned threads, Trace& trace,
             event.person = people->name(event.person);
             records[worker][event.person % partition_count].push_back(event);
         };
-        size_t capacity = std::bit_ceil(candidates + candidates / 2 + 1);
+        // Each occupied filter slot contributes at most twice its collisions.
+        size_t capacity = std::bit_ceil(3 * collisions + 1);
         std::vector<const Candidate*> table(capacity);
         visit([&](const Candidate& entry) {
             size_t i = filter_slot(entry.id);
-            if (!(repeated[i / 64] & (uint64_t{1} << (i % 64)))) {
+            if (!(seen[i / 32] & (uint64_t{2} << (2 * (i % 32))))) {
                 emit(entry);
                 return;
             }
