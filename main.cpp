@@ -260,17 +260,21 @@ template<size_t N, unsigned Shift, class Row> class Delimited {
 public:
     Delimited(const char* start, Row& row) : row_(row), line_(start), field_(start) {}
 
-    void block(const char* data, uint64_t ends, uint64_t quotes) {
+#if defined(__x86_64__)
+    __attribute__((target("popcnt"), always_inline))
+#endif
+    void block(const char* data, uint64_t ends, uint64_t quotes, uint64_t newlines = 0) {
         while (ends) {
             unsigned bit = std::countr_zero(ends);
             const char* separator = data + (bit >> Shift);
             uint64_t before = quotes & ((uint64_t{1} << bit) - 1);
-            if (before) quotes_ = std::min(3u, quotes_ + unsigned(std::popcount(before)));
+            if (before) quotes_ = std::min(3u, quotes_ + unsigned(__builtin_popcountll(before)));
             quotes ^= before;
             field(separator);
             field_ = separator + 1;
             quotes_ = 0;
-            if (*separator == '\n') {
+            const bool newline = Shift ? *separator == '\n' : ((newlines >> bit) & 1);
+            if (newline) {
                 if (!malformed_ && column_ == N) row_(View(line_, separator - line_), fields_);
                 line_ = field_;
                 column_ = 0;
@@ -278,7 +282,7 @@ public:
             }
             ends &= ends - 1;
         }
-        if (quotes) quotes_ = std::min(3u, quotes_ + unsigned(std::popcount(quotes)));
+        if (quotes) quotes_ = std::min(3u, quotes_ + unsigned(__builtin_popcountll(quotes)));
     }
 
     void finish(const char* end) {
@@ -287,18 +291,40 @@ public:
 };
 
 #if defined(__x86_64__)
+struct Markers {
+    uint64_t commas, newlines, quotes;
+};
+
+__attribute__((target("avx2"), always_inline)) inline Markers avx2_markers(const char* p) {
+    auto data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+    return {uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(',')))),
+            uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8('\n')))),
+            uint32_t(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8('"'))))};
+}
+
+__attribute__((target("avx512bw"), always_inline)) inline Markers avx512_markers(const char* p) {
+    auto data = _mm512_loadu_si512(p);
+    return {_mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(',')),
+            _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('\n')),
+            _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('"'))};
+}
+
 template<size_t N, class Row> __attribute__((target("avx2,popcnt")))
 void scan_avx2(View chunk, Row row) {
     const char* p = chunk.data();
     const char* end = p + chunk.size();
     Delimited<N, 0, Row> parser(p, row);
+    // Consume only the prefix so the following loads stay within cache lines.
+    size_t prefix = -reinterpret_cast<uintptr_t>(p) & 31;
+    if (prefix && end - p >= 32) {
+        const auto [commas, newlines, quotes] = avx2_markers(p);
+        uint64_t keep = (uint64_t{1} << prefix) - 1;
+        parser.block(p, (commas | newlines) & keep, quotes & keep, newlines);
+        p += prefix;
+    }
     for (; end - p >= 32; p += 32) {
-        auto data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-        auto comma = _mm256_cmpeq_epi8(data, _mm256_set1_epi8(','));
-        auto newline = _mm256_cmpeq_epi8(data, _mm256_set1_epi8('\n'));
-        auto quotes = _mm256_cmpeq_epi8(data, _mm256_set1_epi8('"'));
-        parser.block(p, uint32_t(_mm256_movemask_epi8(_mm256_or_si256(comma, newline))),
-                        uint32_t(_mm256_movemask_epi8(quotes)));
+        const auto [commas, newlines, quotes] = avx2_markers(p);
+        parser.block(p, commas | newlines, quotes, newlines);
     }
     parser.finish(end);
 }
@@ -308,12 +334,16 @@ void scan_avx512(View chunk, Row row) {
     const char* p = chunk.data();
     const char* end = p + chunk.size();
     Delimited<N, 0, Row> parser(p, row);
+    size_t prefix = -reinterpret_cast<uintptr_t>(p) & 63;
+    if (prefix && end - p >= 64) {
+        const auto [commas, newlines, quotes] = avx512_markers(p);
+        uint64_t keep = (uint64_t{1} << prefix) - 1;
+        parser.block(p, (commas | newlines) & keep, quotes & keep, newlines);
+        p += prefix;
+    }
     for (; end - p >= 64; p += 64) {
-        auto data = _mm512_loadu_si512(p);
-        uint64_t comma = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(','));
-        uint64_t newline = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('\n'));
-        uint64_t quotes = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('"'));
-        parser.block(p, comma | newline, quotes);
+        const auto [commas, newlines, quotes] = avx512_markers(p);
+        parser.block(p, commas | newlines, quotes, newlines);
     }
     parser.finish(end);
 }
