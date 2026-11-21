@@ -1,0 +1,2323 @@
+diff --git a/build.sh b/build.sh
+index 13109ff..d073b72 100644
+--- a/build.sh
++++ b/build.sh
+@@ -25,7 +25,6 @@ case "${SHOPPING_ARCH:-baseline}" in
+     *) echo 'invalid SHOPPING_ARCH' >&2; exit 2 ;;
+ esac
+ 
+-# A hanging training step must not hang the build: it fails into the plain build.
+ limit() {
+     if command -v timeout >/dev/null 2>&1; then
+         timeout -k 10 "${SHOPPING_PGO_TIMEOUT:-120}" "$@"
+@@ -42,7 +41,6 @@ profile() (
+ 
+     case "${SHOPPING_PGO:-gcc}" in
+         gcc)
+-            # The dump call in main.cpp is a weak reference: force the archive member in.
+             "$compiler" "$@" -fprofile-generate="$scratch/profile" \
+                 -fprofile-update=atomic -Wl,--undefined=__gcov_dump "$source_dir/main.cpp" -o shopping || exit 1
+             ;;
+diff --git a/csv_index.hpp b/csv_index.hpp
+index e156ddd..ee0b014 100644
+--- a/csv_index.hpp
++++ b/csv_index.hpp
+@@ -2,14 +2,52 @@
+ 
+ struct CsvMarkers { uint64_t commas, lines, quotes; };
+ 
+-// Index enough text to keep the separator streams and the subsequent field
+-// loads in cache. An extra slot at the end is a sentinel for malformed rows.
++template<size_t... Slots>
++[[gnu::always_inline]] inline void csv_positions(uint16_t*& out, unsigned base, uint64_t mask,
++                                                 std::index_sequence<Slots...>) {
++    unsigned count = std::popcount(mask);
++    auto write = [&](size_t slot) {
++        out[slot] = base + __builtin_ctzll(mask | (uint64_t{1} << 63));
++        mask &= mask - 1;
++    };
++    (write(Slots), ...);
++    asm volatile("" : : "r"(out) : "memory");
++    auto* excess = out + sizeof...(Slots);
++    out += count;
++    for (; excess < out; ++excess) {
++        *excess = base + __builtin_ctzll(mask);
++        mask &= mask - 1;
++    }
++}
++
++struct IndexedCsvRow {
++    const char* data;
++    const uint16_t* ends;
++    unsigned begin;
++
++    template<size_t I> size_t field(const char*& text) const {
++        unsigned start = I ? ends[I - 1] + 1 : begin;
++        unsigned quoted = data[start] == '"';
++        text = data + start + quoted;
++        return ends[I] - start - 2 * quoted;
++    }
++};
++
++template<size_t N> struct ScalarCsvRow {
++    const Fields<N>& fields;
++
++    template<size_t I> size_t field(const char*& text) const {
++        text = fields[I].data();
++        return fields[I].size();
++    }
++};
++
+ class CsvIndex {
+ public:
+     static constexpr size_t batch_bytes = 16 * 1024;
+ 
+ private:
+-    uint16_t ends_[batch_bytes + 8], lines_[batch_bytes + 8], errors_[batch_bytes + 1];
++    uint16_t ends_[batch_bytes + 12], lines_[batch_bytes + 4], errors_[batch_bytes + 1];
+     uint16_t* end_ = ends_;
+     uint16_t* line_ = lines_;
+     uint16_t* error_ = errors_;
+@@ -23,14 +61,12 @@ private:
+     }
+ 
+ public:
+-    void block(unsigned base, CsvMarkers marks) {
++    template<size_t Ends, size_t Lines> [[gnu::always_inline]] void block(unsigned base, CsvMarkers marks) {
+         uint64_t sep = marks.commas | marks.lines;
+         uint64_t open = marks.quotes & ((sep << 1) | after_separator_);
+         uint64_t close = marks.quotes ^ open;
+         uint64_t after_open = (open << 1) | after_open_;
+         uint64_t after_close = (close << 1) | after_close_;
+-        // Borrow from each opening position through to its next separator.
+-        // A separator whose bit is consumed must follow a closing quote.
+         uint64_t remaining = sep - open;
+         uint64_t wrapped = sep & ~(remaining - in_quoted_field_);
+         uint64_t bad = (after_close & ~sep) | (after_open & sep) | ((after_close ^ wrapped) & sep);
+@@ -38,8 +74,8 @@ public:
+         after_separator_ = sep >> 63;
+         after_open_ = open >> 63;
+         after_close_ = close >> 63;
+-        append(end_, base, sep);
+-        append(line_, base, marks.lines);
++        csv_positions(end_, base, sep, std::make_index_sequence<Ends>{});
++        csv_positions(line_, base, marks.lines, std::make_index_sequence<Lines>{});
+         append(error_, base, bad);
+     }
+ 
+@@ -51,15 +87,10 @@ public:
+         unsigned begin = 0;
+         for (auto line = lines_; line != line_; ++line) {
+             unsigned end = *line;
+-            if (field[N - 1] == end && *error > end) {
+-                Fields<N> fields;
+-                unsigned start = begin;
+-                for (size_t i = 0; i < N; ++i) {
+-                    unsigned quoted = data[start] == '"';
+-                    fields[i] = View(data + start + quoted, field[i] - start - 2 * quoted);
+-                    start = field[i] + 1;
+-                }
+-                row(View(data + begin, end - begin), fields);
++            unsigned regular = (field[N - 1] == end) & (*error > end);
++            asm("" : "+r"(regular));
++            if (regular) {
++                row(IndexedCsvRow{data, field, begin});
+                 field += N;
+             } else {
+                 while (*field <= end) ++field;
+@@ -101,30 +132,66 @@ inline CsvMarkers csv_neon(const char* p) {
+ }
+ #endif
+ 
+-template<auto Mark> [[gnu::always_inline]] inline void csv_blocks_impl(CsvIndex& index, View batch) {
++inline size_t csv_prefetch_distance() {
++    constexpr size_t default_distance = 1024;
++    static const size_t distance = [] {
++        const char* setting = std::getenv("SHOPPING_CSV_PREFETCH");
++        if (!setting) return default_distance;
++        size_t bytes = 0;
++        const char* end = setting + std::strlen(setting);
++        auto [last, error] = std::from_chars(setting, end, bytes);
++        return error == std::errc{} && last == end && bytes <= 16384 ? bytes : default_distance;
++    }();
++    return distance;
++}
++
++template<auto Mark, size_t Ends, size_t Lines>
++[[gnu::always_inline]] inline void csv_blocks_impl(CsvIndex& index, View input, size_t size) {
+     unsigned offset = 0;
+-    for (; offset + 64 <= batch.size(); offset += 64) index.block(offset, Mark(batch.data() + offset));
+-    if (offset < batch.size()) {
++    size_t distance = csv_prefetch_distance();
++    size_t prefetch_until = distance && distance < input.size() ? input.size() - distance : 0;
++    for (; offset + 64 <= size; offset += 64) {
++        if (offset < prefetch_until) __builtin_prefetch(input.data() + offset + distance, 0, 3);
++        index.block<Ends, Lines>(offset, Mark(input.data() + offset));
++    }
++    if (offset < size) {
+         alignas(64) char tail[64]{};
+-        std::memcpy(tail, batch.data() + offset, batch.size() - offset);
+-        index.block(offset, Mark(tail));
++        std::memcpy(tail, input.data() + offset, size - offset);
++        index.block<Ends, Lines>(offset, Mark(tail));
+     }
+ }
+ 
+-template<auto Mark> void csv_blocks(CsvIndex& index, View batch) {
+-    csv_blocks_impl<Mark>(index, batch);
+-}
++template<auto Mark, size_t Ends, size_t Lines> struct CsvBlocks {
++    static void run(CsvIndex& index, View input, size_t size) {
++        csv_blocks_impl<Mark, Ends, Lines>(index, input, size);
++    }
++};
+ 
+ #if defined(__x86_64__)
+-template<> __attribute__((target("avx2"))) inline void csv_blocks<csv_avx2>(CsvIndex& index, View batch) {
+-    csv_blocks_impl<csv_avx2>(index, batch);
+-}
++template<size_t Ends, size_t Lines> struct CsvBlocks<csv_avx2, Ends, Lines> {
++    __attribute__((target("avx2,popcnt"))) static void run(CsvIndex& index, View input, size_t size) {
++        csv_blocks_impl<csv_avx2, Ends, Lines>(index, input, size);
++    }
++};
+ 
+-template<> __attribute__((target("avx512bw"))) inline void csv_blocks<csv_avx512>(CsvIndex& index, View batch) {
+-    csv_blocks_impl<csv_avx512>(index, batch);
+-}
++template<size_t Ends, size_t Lines> struct CsvBlocks<csv_avx512, Ends, Lines> {
++    __attribute__((target("avx512bw,popcnt"))) static void run(CsvIndex& index, View input, size_t size) {
++        csv_blocks_impl<csv_avx512, Ends, Lines>(index, input, size);
++    }
++};
+ #endif
+ 
++template<auto Mark> inline void csv_blocks(CsvIndex& index, View input, size_t size) {
++    static const auto run = [] {
++        const char* setting = std::getenv("SHOPPING_CSV_WRITES");
++        if (setting && std::strcmp(setting, "4/1") == 0) return &CsvBlocks<Mark, 4, 1>::run;
++        if (setting && std::strcmp(setting, "12/4") == 0) return &CsvBlocks<Mark, 12, 4>::run;
++        if (setting && std::strcmp(setting, "0/0") == 0) return &CsvBlocks<Mark, 0, 0>::run;
++        return &CsvBlocks<Mark, 8, 2>::run;
++    }();
++    run(index, input, size);
++}
++
+ template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row) {
+     while (!chunk.empty()) {
+         size_t size = std::min(chunk.size(), CsvIndex::batch_bytes);
+@@ -132,12 +199,13 @@ template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row)
+         if (!size) {
+             size_t lf = chunk.find('\n');
+             size = lf == View::npos ? chunk.size() : lf + 1;
+-            scan_scalar<N>(chunk.substr(0, size), row);
++            scan_scalar<N>(chunk.substr(0, size),
++                           [&](View, const Fields<N>& fields) { row(ScalarCsvRow<N>{fields}); });
+         } else {
+             CsvIndex index;
+             {
+                 SHOPPING_TIME(timing::Scope markers(timing::MarkerScan);)
+-                csv_blocks<Mark>(index, chunk.substr(0, size));
++                csv_blocks<Mark>(index, chunk, size);
+             }
+             index.parse<N>(chunk.data(), row);
+         }
+diff --git a/detail_trace.hpp b/detail_trace.hpp
+index 3f44489..9873139 100644
+--- a/detail_trace.hpp
++++ b/detail_trace.hpp
+@@ -226,7 +226,7 @@ public:
+ #endif
+     }
+ };
+-} // namespace timing
++}
+ #endif
+ 
+ #ifdef SHOPPING_DETAIL_TRACE
+diff --git a/large_memory.hpp b/large_memory.hpp
+new file mode 100644
+index 0000000..4a07712
+--- /dev/null
++++ b/large_memory.hpp
+@@ -0,0 +1,125 @@
++#pragma once
++
++#include <algorithm>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <new>
++#include <type_traits>
++#include <unordered_map>
++#include <vector>
++
++#include <sys/mman.h>
++
++namespace memory {
++
++enum class Release { None, Exit, Early };
++enum class Method { Advise, Unmap };
++struct Settings { Release release; Method method; };
++
++#ifdef __linux__
++inline constexpr Settings defaults{Release::Exit, Method::Advise};
++#else
++inline constexpr Settings defaults{Release::Exit, Method::Unmap};
++#endif
++
++inline const Settings& settings() {
++    static const Settings selected = [] {
++        auto result = defaults;
++        if (const char* release = std::getenv("SHOPPING_RELEASE")) {
++            if (std::strcmp(release, "none") == 0) result.release = Release::None;
++            if (std::strcmp(release, "exit") == 0) result.release = Release::Exit;
++            if (std::strcmp(release, "early") == 0) result.release = Release::Early;
++        }
++        if (const char* method = std::getenv("SHOPPING_RELEASE_METHOD")) {
++            if (std::strcmp(method, "advise") == 0) result.method = Method::Advise;
++            if (std::strcmp(method, "unmap") == 0) result.method = Method::Unmap;
++        }
++        return result;
++    }();
++    return selected;
++}
++
++struct Region { void* address; size_t bytes; };
++inline std::mutex region_lock;
++inline std::unordered_map<void*, size_t> live_regions;
++
++inline void remember(Region region) {
++    if (settings().release == Release::None) return;
++    std::lock_guard lock(region_lock);
++    live_regions.emplace(region.address, region.bytes);
++}
++
++inline void forget(void* address) {
++    if (settings().release == Release::None) return;
++    std::lock_guard lock(region_lock);
++    live_regions.erase(address);
++}
++
++inline std::vector<Region> take_all() {
++    std::lock_guard lock(region_lock);
++    std::vector<Region> regions;
++    regions.reserve(live_regions.size());
++    for (auto [address, bytes] : live_regions) regions.push_back({address, bytes});
++    live_regions.clear();
++    return regions;
++}
++
++inline void release(Region region, Method method) {
++    if (method == Method::Advise && madvise(region.address, region.bytes, MADV_DONTNEED) == 0) return;
++    munmap(region.address, region.bytes);
++}
++
++template<class T> struct Allocator {
++    using value_type = T;
++
++    Allocator() = default;
++    template<class U> Allocator(const Allocator<U>&) {}
++    template<class U> bool operator==(const Allocator<U>&) const { return true; }
++
++    static bool uses_map(size_t count) {
++        return settings().release != Release::None && count >= ((1 << 20) + sizeof(T) - 1) / sizeof(T);
++    }
++
++    T* allocate(size_t count) {
++        if (!uses_map(count)) return std::allocator<T>{}.allocate(count);
++        if (count > size_t(-1) / sizeof(T)) throw std::bad_array_new_length();
++        size_t bytes = count * sizeof(T);
++        void* address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (address == MAP_FAILED) throw std::bad_alloc();
++        try {
++            remember({address, bytes});
++        } catch (...) {
++            munmap(address, bytes);
++            throw;
++        }
++        return static_cast<T*>(address);
++    }
++
++    void deallocate(T* data, size_t count) {
++        if (!uses_map(count)) return std::allocator<T>{}.deallocate(data, count);
++        forget(data);
++        munmap(data, count * sizeof(T));
++    }
++};
++
++template<class T> using Vector = std::vector<T, Allocator<T>>;
++
++template<class K, class V, class Hash = std::hash<K>>
++using Map = std::unordered_map<K, V, Hash, std::equal_to<K>, Allocator<std::pair<const K, V>>>;
++
++template<class T> struct ArrayDeleter {
++    size_t count = 0;
++    void operator()(T* data) const { Allocator<T>{}.deallocate(data, count); }
++};
++
++template<class T> using Array = std::unique_ptr<T[], ArrayDeleter<T>>;
++
++template<class T> Array<T> array(size_t count) {
++    static_assert(std::is_trivially_default_constructible_v<T> && std::is_trivially_destructible_v<T>);
++    auto* data = Allocator<T>{}.allocate(count);
++    return Array<T>(::new (data) T[count], ArrayDeleter<T>{count});
++}
++
++}
+diff --git a/main.cpp b/main.cpp
+index cfbeb61..d83aba0 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -12,6 +12,7 @@
+ #include <optional>
+ #include <thread>
+ #include <unordered_map>
++#include <utility>
+ 
+ #include <fcntl.h>
+ #include <sys/mman.h>
+@@ -53,7 +54,7 @@ struct Hash {
+     }
+ };
+ 
+-template<class V> using StringMap = std::unordered_map<View, V, Hash>;
++template<class V> using StringMap = memory::Map<View, V, Hash>;
+ 
+ class Mapping {
+     View data_;
+@@ -71,6 +72,12 @@ public:
+             void* address = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+             close(fd);
+             if (address == MAP_FAILED) throw std::runtime_error("cannot map " + path.string());
++            try {
++                memory::remember({address, size});
++            } catch (...) {
++                munmap(address, size);
++                throw;
++            }
+             data_ = View(static_cast<const char*>(address), size);
+         } else {
+             close(fd);
+@@ -78,8 +85,19 @@ public:
+     }
+     Mapping(const Mapping&) = delete;
+     Mapping& operator=(const Mapping&) = delete;
+-    ~Mapping() { if (!data_.empty()) munmap(const_cast<char*>(data_.data()), data_.size()); }
++    ~Mapping() {
++        if (data_.empty()) return;
++        auto region = take();
++        munmap(region.address, region.bytes);
++    }
+     View bytes() const { return data_; }
++
++    memory::Region take() {
++        memory::Region region{const_cast<char*>(data_.data()), data_.size()};
++        if (region.bytes) memory::forget(region.address);
++        data_ = {};
++        return region;
++    }
+ };
+ 
+ struct Input {
+@@ -118,6 +136,13 @@ struct Input {
+             input.remove_prefix(end);
+         }
+     }
++
++    void take_mappings(std::vector<memory::Region>& regions) const {
++        regions.reserve(regions.size() + maps.size());
++        for (const auto& map : maps) {
++            if (!map->bytes().empty()) regions.push_back(map->take());
++        }
++    }
+ };
+ 
+ 
+@@ -149,6 +174,17 @@ void parallel(unsigned threads, size_t tasks, Work work, Finish finish = nullptr
+     if (error) std::rethrow_exception(error);
+ }
+ 
++void release_parallel(const std::vector<memory::Region>& regions, unsigned threads) {
++    constexpr size_t piece_bytes = 4 << 20;
++    std::vector<memory::Region> pieces;
++    for (const auto& [address, bytes] : regions) {
++        for (size_t offset = 0; offset < bytes; offset += piece_bytes)
++            pieces.push_back({static_cast<char*>(address) + offset, std::min(bytes - offset, piece_bytes)});
++    }
++    auto method = memory::settings().method;
++    parallel(threads, pieces.size(), [&](unsigned, size_t i) { memory::release(pieces[i], method); });
++}
++
+ template<size_t N> using Fields = std::array<View, N>;
+ 
+ template<size_t N> bool split(View line, Fields<N>& fields) {
+@@ -190,7 +226,6 @@ Scanner select_scanner() {
+         !__get_cpuid_count(7, 0, &a, &b, &c, &d)) return Scanner::Scalar;
+     unsigned xcr0, upper;
+     __asm__ volatile("xgetbv" : "=a"(xcr0), "=d"(upper) : "c"(0));
+-    // XCR0 must enable SSE/YMM and, for AVX-512, the opmask and ZMM state.
+     constexpr unsigned avx512 = bit_AVX512F | bit_AVX512BW;
+     if ((xcr0 & 0xe6) == 0xe6 && (b & avx512) == avx512) return Scanner::Avx512;
+     if ((xcr0 & 0x06) == 0x06 && (b & bit_AVX2)) return Scanner::Avx2;
+@@ -220,6 +255,8 @@ public:
+         mark("start");
+     }
+ 
++    bool enabled() const { return enabled_; }
++
+     void mark(const char* phase) {
+         if (!enabled_) return;
+         timespec now{};
+@@ -239,8 +276,51 @@ public:
+ 
+ };
+ 
+-// A block supplies the positions of commas, LF and quotes. Shift is zero for
+-// x86's one bit per byte and two for NEON's four bits per byte.
++struct GroupTrace {
++    int64_t cpu_ns = 0;
++    size_t bucket_partitions = 0, sorted_partitions = 0, bucket_rows = 0;
++
++    static int64_t cpu() {
++        timespec now{};
++        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
++        return int64_t(now.tv_sec) * 1'000'000'000 + now.tv_nsec;
++    }
++
++    struct Scope {
++        GroupTrace* trace;
++        int64_t start = trace ? cpu() : 0;
++        ~Scope() { if (trace) trace->cpu_ns += cpu() - start; }
++    };
++};
++
++struct LinkTrace {
++    int64_t begin = 0, end = 0, join_ns = 0, names_ns = 0;
++    int64_t sampled_intern_ns = 0, sampled_union_ns = 0, sampled_names_ns = 0, sampled_bitmap_ns = 0;
++    size_t rows = 0, aliases = 0;
++
++    static int64_t now() {
++        timespec value{};
++        clock_gettime(CLOCK_MONOTONIC, &value);
++        return int64_t(value.tv_sec) * 1'000'000'000 + value.tv_nsec;
++    }
++
++    static int64_t sample(size_t& count) { return (++count % 256 == 1) ? now() : 0; }
++
++    void report(int64_t ingest_start, int64_t events_end) const {
++        auto ms = [](int64_t ns) { return double(ns) / 1e6; };
++        auto estimate = [](int64_t ns, size_t count) {
++            return count ? double(ns) / 1e6 * count / ((count - 1) / 256 + 1) : 0.0;
++        };
++        double intern = estimate(sampled_intern_ns, rows), unions = estimate(sampled_union_ns, rows);
++        std::fprintf(stderr,
++            "links wall_ms %.3f done_ms %.3f last_event_chunk_ms %.3f scan_est_ms %.3f intern_est_ms %.3f "
++            "union_est_ms %.3f names_bitmap_ms %.3f names_est_ms %.3f bitmap_est_ms %.3f\n",
++            ms(end - begin), ms(end - ingest_start), ms(events_end - ingest_start),
++            std::max(0.0, ms(join_ns) - intern - unions), intern, unions, ms(names_ns),
++            estimate(sampled_names_ns, aliases), estimate(sampled_bitmap_ns, aliases));
++    }
++};
++
+ template<size_t N, unsigned Shift, class Row> class Delimited {
+     Row& row_;
+     const char* line_;
+@@ -324,7 +404,6 @@ void scan_avx2(View chunk, Row row) {
+     const char* p = chunk.data();
+     const char* end = p + chunk.size();
+     Delimited<N, 0, Row> parser(p, row);
+-    // Consume only the prefix so the following loads stay within cache lines.
+     size_t prefix = -reinterpret_cast<uintptr_t>(p) & 31;
+     if (prefix && end - p >= 32) {
+         const auto [commas, newlines, quotes] = avx2_markers(p);
+@@ -380,18 +459,21 @@ template<size_t N, class Row> void scan_neon(View chunk, Row row) {
+ 
+ #include "csv_index.hpp"
+ 
++template<size_t N, class Row> void scan_fields(View chunk, Row row) {
++#if defined(__x86_64__)
++    if (scanner == Scanner::Avx512) return scan_indexed<N, csv_avx512>(chunk, row);
++    if (scanner == Scanner::Avx2) return scan_indexed<N, csv_avx2>(chunk, row);
++#elif defined(__aarch64__)
++    if (scanner == Scanner::Neon) return scan_indexed<N, csv_neon>(chunk, row);
++#endif
++    scan_scalar<N>(chunk, [&](View, const Fields<N>& fields) { row(ScalarCsvRow<N>{fields}); });
++}
++
+ template<size_t N, class Row> void scan(View chunk, Row row) {
+ #if defined(__x86_64__)
+-    if constexpr (N >= 4) {
+-        if (scanner == Scanner::Avx512) return scan_indexed<N, csv_avx512>(chunk, row);
+-        if (scanner == Scanner::Avx2) return scan_indexed<N, csv_avx2>(chunk, row);
+-    }
+     if (scanner == Scanner::Avx512) return scan_avx512<N>(chunk, row);
+     if (scanner == Scanner::Avx2) return scan_avx2<N>(chunk, row);
+ #elif defined(__aarch64__)
+-    if constexpr (N >= 4) {
+-        if (scanner == Scanner::Neon) return scan_indexed<N, csv_neon>(chunk, row);
+-    }
+     if (scanner == Scanner::Neon) return scan_neon<N>(chunk, row);
+ #endif
+     scan_scalar<N>(chunk, row);
+@@ -471,43 +553,61 @@ int64_t epoch_millis_13(const char* p) {
+     unsigned last = uint8_t(p[12]) - unsigned('0');
+     first ^= 0x3030303030303030ULL;
+     next ^= 0x30303030U;
+-    if (((first | (first + 0x0606060606060606ULL) | next | (next + 0x06060606U)) &
+-         0xf0f0f0f0f0f0f0f0ULL) || last > 9) return bad_time;
++    bool digits = !((first | (first + 0x0606060606060606ULL) | next | (next + 0x06060606U)) &
++                    0xf0f0f0f0f0f0f0f0ULL) & (last <= 9);
+     auto four = [](uint64_t digits) {
+         uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+         return (pairs * 100 + (pairs >> 16)) & 0x0000ffff0000ffffULL;
+     };
+     uint64_t groups = four(first);
+     uint64_t first_eight = uint32_t(groups) * 10000 + (groups >> 32);
+-    return first_eight * 100000 + four(next) * 10 + last;
++    uint64_t value = first_eight * 100000 + four(next) * 10 + last;
++    return (value & (uint64_t{0} - digits)) | (uint64_t(bad_time) * !digits);
+ }
+ 
+ int clock_seconds(const char* p) {
+     uint64_t word;
+     std::memcpy(&word, p, sizeof(word));
+-    // The two colons must match exactly. Validate all six digits together.
+     word ^= 0x30303a30303a3030ULL;
+-    if ((word | (word + 0x0606000606000606ULL)) & 0xf0f0fff0f0fff0f0ULL) return -1;
++    bool digits = !((word | (word + 0x0606000606000606ULL)) & 0xf0f0fff0f0fff0f0ULL);
+     uint64_t pairs = word * 10 + (word >> 8);
+     unsigned h = uint8_t(pairs), m = uint8_t(pairs >> 24), s = uint8_t(pairs >> 48);
+-    if ((h > 23) | (m > 59) | (s > 59)) return -1;
+-    return h * 3600 + m * 60 + s;
++    bool valid = digits & (h <= 23) & (m <= 59) & (s <= 59);
++    return int(h * 3600 + m * 60 + s) * valid - !valid;
+ }
+ 
+-int unchecked_clock_seconds(const char* p) {
+-    uint64_t word;
+-    std::memcpy(&word, p, sizeof(word));
+-    word &= 0x0f0f000f0f000f0fULL;
+-    uint64_t pairs = word * 10 + (word >> 8);
++int zone_seconds(const char* p) {
++    unsigned word;
++    std::memcpy(&word, p + 1, sizeof(word));
++    word ^= 0x303a3030U;
++    unsigned last = uint8_t(p[5]) - unsigned('0');
++    bool digits = !((word | (word + 0x06000606U)) & 0xf0fff0f0U) & (last <= 9);
++    unsigned hours = (word & 255) * 10 + ((word >> 8) & 255);
++    unsigned minutes = (word >> 24) * 10 + (last & 15);
++    bool west = p[0] == '-', east = p[0] == '+';
++    bool valid = digits & (hours <= 23) & (minutes <= 59) & (west | east);
++    int seconds = int(hours * 3600 + minutes * 60);
++    return ((seconds * (int(east) - int(west))) & -int(valid)) | (INT32_MIN * !valid);
++}
++
++int ingest_pair(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
++
++int ingest_seconds(const char* p) {
++    uint64_t digits;
++    std::memcpy(&digits, p, sizeof(digits));
++    digits = (digits ^ 0x3030003030003030ULL) & 0xffff00ffff00ffffULL;
++    if ((digits | (digits + 0x0606000606000606ULL)) & 0xf0f000f0f000f0f0ULL)
++        return (ingest_pair(p) * 60 + ingest_pair(p + 3)) * 60 + ingest_pair(p + 6);
++    uint64_t pairs = digits * 10 + (digits >> 8);
+     return uint8_t(pairs) * 3600 + uint8_t(pairs >> 24) * 60 + uint8_t(pairs >> 48);
+ }
+ 
+ int64_t ingest_timestamp(const char* p) {
+-    auto pair = [](const char* digits) { return (digits[0] - '0') * 10 + (digits[1] - '0'); };
+-    int y = pair(p) * 100 + pair(p + 2), m = pair(p + 5), d = pair(p + 8);
++    int y = ingest_pair(p) * 100 + ingest_pair(p + 2), m = ingest_pair(p + 5), d = ingest_pair(p + 8);
++    if (unsigned(y) >= years.size() || unsigned(m - 1) >= 12) return bad_time;
+     auto [year_days, leap] = years[y];
+     int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+-    return int64_t(days) * day_ms + unchecked_clock_seconds(p + 11) * 1000;
++    return int64_t(days) * day_ms + int64_t(ingest_seconds(p + 11)) * 1000;
+ }
+ 
+ int32_t utc_day(int64_t t) { return t / day_ms - (t % day_ms < 0); }
+@@ -686,11 +786,9 @@ private:
+         return result;
+     }
+ 
+-    const Date* cached_date(const char* s) const {
++    static bool date_matches(const Date& entry, const char* s) {
+         auto key = date_key(s);
+-        const auto& entry = dates_[date_slot(s)];
+-        return entry.prefix && ((entry.prefix ^ key.prefix) | (entry.suffix ^ key.suffix)) == 0
+-            ? &entry : nullptr;
++        return (entry.prefix != 0) & (((entry.prefix ^ key.prefix) | (entry.suffix ^ key.suffix)) == 0);
+     }
+ 
+ public:
+@@ -718,20 +816,35 @@ public:
+     }
+ 
+     int64_t event_time(View text) const {
+-        if (text.size() == 13) return epoch_millis_13(text.data());
+-        if (text.size() == 20 && text[19] == 'Z') {
+-            if (auto* date = cached_date(text.data())) {
+-                int seconds = clock_seconds(text.data() + 11);
+-                return seconds < 0 ? bad_time : int64_t(date->day) * day_ms + seconds * 1000;
+-            }
+-        }
+-        return timestamp(text);
+-    }
+-
+-    int64_t ingest_time(const char* text) const {
+-        if (auto* date = cached_date(text))
+-            return int64_t(date->day) * day_ms + unchecked_clock_seconds(text + 11) * 1000;
+-        return ingest_timestamp(text);
++        bool epoch = text.size() == 13, utc = text.size() == 20, offset = text.size() == 25;
++        unsigned supported = epoch | utc | offset;
++        asm("" : "+r"(supported));
++        if (!supported) return timestamp(text);
++        static constexpr char dummy[] = "0000-00-00T00:00:00+00:00";
++        uintptr_t epoch_mask = uintptr_t{0} - epoch;
++        asm("" : "+r"(epoch_mask));
++        auto address = (reinterpret_cast<uintptr_t>(dummy) & epoch_mask) |
++                       (reinterpret_cast<uintptr_t>(text.data()) & ~epoch_mask);
++        const auto* calendar = reinterpret_cast<const char*>(address);
++        const auto& date = dates_[date_slot(calendar)];
++        unsigned uncached = !epoch & !date_matches(date, calendar);
++        asm("" : "+r"(uncached));
++        if (uncached) return timestamp(text);
++        int seconds = clock_seconds(calendar + 11);
++        int zone = zone_seconds(offset ? calendar + 19 : dummy + 19);
++        bool calendar_valid = (seconds >= 0) & (((calendar[19] == 'Z') & utc) | ((zone != INT32_MIN) & offset));
++        int64_t time = int64_t(date.day) * day_ms + (int64_t(seconds) - zone) * 1000;
++        uint64_t calendar_time = (uint64_t(time) & (uint64_t{0} - calendar_valid)) |
++                                 (uint64_t(bad_time) * !calendar_valid);
++        return (uint64_t(epoch_millis_13(text.data())) & epoch_mask) | (calendar_time & ~epoch_mask);
++    }
++
++    int64_t ingest_time(View text) const {
++        if (text.size() != 20) return bad_time;
++        const auto& date = dates_[date_slot(text.data())];
++        if (date_matches(date, text.data()))
++            return int64_t(date.day) * day_ms + int64_t(ingest_seconds(text.data() + 11)) * 1000;
++        return ingest_timestamp(text.data());
+     }
+ };
+ 
+@@ -746,15 +859,12 @@ class Ids {
+     struct Shard {
+         std::mutex lock;
+         StringMap<uint32_t> indices;
+-        // Fields point into input mappings that outlive this index.
+-        std::vector<View> names;
++        memory::Vector<View> names;
+         size_t longest = 0;
+     };
+     std::array<Shard, 64> shards_;
+     char prefix_;
+ 
+-    // Nonzero ASCII bytes take seven bits each. The zero padding distinguishes
+-    // different lengths. Other byte strings use the high-bit tag and a shard index.
+     uint64_t inline_id(View bytes) const {
+         if (bytes.size() == 9 && bytes[0] == prefix_) {
+             uint64_t suffix;
+@@ -818,7 +928,9 @@ public:
+         return length;
+     }
+ 
+-    // Called after the input stages have stopped interning IDs.
++    bool has_input_views() const {
++        return std::any_of(shards_.begin(), shards_.end(), [](const Shard& shard) { return !shard.names.empty(); });
++    }
+     View name(Person key, char (&buffer)[9]) const {
+         uint64_t value = (key ^ (key >> 32)) * inverse;
+         if (value & external) {
+@@ -844,31 +956,31 @@ public:
+ class People {
+     struct Alias { Person key = 0, value = 0; };
+     struct MemberIndexOverflow {};
+-    std::vector<Alias> aliases_ = std::vector<Alias>(32);
+-    std::vector<uint64_t> has_alias_;
++    memory::Vector<Alias> aliases_ = memory::Vector<Alias>(32);
++    memory::Vector<uint64_t> has_alias_;
+ 
+     size_t alias_bit(Person key) const {
+         return (key >> 12) & (has_alias_.size() * 64 - 1);
+     }
+ 
+-    static size_t slot(const std::vector<Alias>& aliases, Person key) {
++    static size_t slot(const memory::Vector<Alias>& aliases, Person key) {
+         size_t mask = aliases.size() - 1;
+         size_t i = key & mask;
+         while (aliases[i].key && aliases[i].key != key) i = (i + 1) & mask;
+         return i;
+     }
+ 
+-    template<class Index> void build(const Input& links, Ids& ids) {
++    template<class Index, bool Measure> void build(const Input& links, Ids& ids, LinkTrace* trace) {
++        int64_t join_start = Measure ? LinkTrace::now() : 0;
+         struct Member { View name; Person key; Index parent, size; };
+-        std::vector<Member> members;
++        memory::Vector<Member> members;
+         auto add = [&](View name) {
+             Person key = ids.key(name);
+             size_t i = slot(aliases_, key);
+             if (aliases_[i].key) return static_cast<Index>(aliases_[i].value);
+-            // The largest possible component must also fit in Index.
+             if (members.size() == std::numeric_limits<Index>::max()) throw MemberIndexOverflow{};
+             if ((members.size() + 1) * 4 > aliases_.size() * 3) {
+-                std::vector<Alias> grown(aliases_.size() * 2);
++                memory::Vector<Alias> grown(aliases_.size() * 2);
+                 for (const auto& alias : aliases_)
+                     if (alias.key) grown[slot(grown, alias.key)] = alias;
+                 aliases_.swap(grown);
+@@ -888,51 +1000,135 @@ class People {
+         };
+         for (View chunk : links.chunks) scan<2>(chunk, [&](View, const Fields<2>& fields) {
+             if (fields[0].empty() || fields[1].empty()) return;
+-            Index a = root(add(fields[0])), b = root(add(fields[1]));
+-            if (a == b) return;
+-            if (members[a].size < members[b].size) std::swap(a, b);
+-            members[b].parent = a;
+-            members[a].size += members[b].size;
+-            if (members[b].name < members[a].name) {
+-                members[a].name = members[b].name;
+-                members[a].key = members[b].key;
++            int64_t start = Measure ? LinkTrace::sample(trace->rows) : 0;
++            Index first = add(fields[0]), second = add(fields[1]);
++            int64_t added = start ? LinkTrace::now() : 0;
++            Index a = root(first), b = root(second);
++            if (a != b) {
++                if (members[a].size < members[b].size) std::swap(a, b);
++                members[b].parent = a;
++                members[a].size += members[b].size;
++                if (members[b].name < members[a].name) {
++                    members[a].name = members[b].name;
++                    members[a].key = members[b].key;
++                }
++            }
++            if (start) {
++                trace->sampled_intern_ns += added - start;
++                trace->sampled_union_ns += LinkTrace::now() - added;
+             }
+         });
++        int64_t names_start = Measure ? LinkTrace::now() : 0;
+         has_alias_.resize(std::max<size_t>(1, aliases_.size() / 8));
+         for (auto& alias : aliases_) if (alias.key) {
++            int64_t start = Measure ? LinkTrace::sample(trace->aliases) : 0;
+             alias.value = members[root(alias.value)].key;
++            int64_t named = start ? LinkTrace::now() : 0;
+             if (alias.key != alias.value) {
+                 size_t bit = alias_bit(alias.key);
+                 has_alias_[bit / 64] |= uint64_t{1} << (bit % 64);
+             }
++            if (start) {
++                trace->sampled_names_ns += named - start;
++                trace->sampled_bitmap_ns += LinkTrace::now() - named;
++            }
++        }
++        if constexpr (Measure) {
++            trace->join_ns = names_start - join_start;
++            trace->names_ns = LinkTrace::now() - names_start;
+         }
+     }
+ 
+ public:
+-    People(const Input& links, Ids& ids) {
++    People(const Input& links, Ids& ids, LinkTrace* trace) {
++        auto build_links = [&]<class Index>() {
++            if (trace) build<Index, true>(links, ids, trace);
++            else build<Index, false>(links, ids, nullptr);
++        };
+         try {
+-            build<uint32_t>(links, ids);
++            build_links.template operator()<uint32_t>();
+         } catch (const MemberIndexOverflow&) {
+-            aliases_ = std::vector<Alias>(32);
+-            build<size_t>(links, ids);
++            aliases_ = memory::Vector<Alias>(32);
++            if (trace) *trace = LinkTrace{trace->begin};
++            build_links.template operator()<size_t>();
+         }
+     }
+ 
+-    Person name(Person key) const {
++    bool might_have_alias(Person key) const {
+         size_t bit = alias_bit(key);
+-        if (!(has_alias_[bit / 64] & (uint64_t{1} << (bit % 64)))) return key;
++        return has_alias_[bit / 64] & (uint64_t{1} << (bit % 64));
++    }
++
++    void prefetch_membership(Person key) const { __builtin_prefetch(&has_alias_[alias_bit(key) / 64], 0, 1); }
++
++    void prefetch_alias(Person key) const { __builtin_prefetch(&aliases_[key & (aliases_.size() - 1)], 0, 1); }
++
++    Person lookup(Person key) const {
+         auto value = aliases_[slot(aliases_, key)].value;
+         return value ? value : key;
+     }
++
++    Person name(Person key) const { return might_have_alias(key) ? lookup(key) : key; }
++};
++
++constexpr size_t max_alias_batch = 64;
++
++template<class Row, class Emit> class PersonBatch {
++    const People& people_;
++    const size_t limit_;
++    Emit emit_;
++    std::array<Row, max_alias_batch> rows_;
++    size_t size_ = 0;
++
++public:
++    PersonBatch(const People& people, size_t limit, Emit emit) : people_(people), limit_(limit), emit_(emit) {}
++
++    void append(Row row) {
++        if (!limit_) {
++            row.person = people_.name(row.person);
++            emit_(row);
++            return;
++        }
++        people_.prefetch_membership(row.person);
++        rows_[size_++] = row;
++        if (size_ == limit_) finish();
++    }
++
++    void finish() {
++        std::array<bool, max_alias_batch> probe;
++        for (size_t i = 0; i < size_; ++i) {
++            auto person = rows_[i].person;
++            probe[i] = people_.might_have_alias(person);
++            if (probe[i]) people_.prefetch_alias(person);
++        }
++        for (size_t i = 0; i < size_; ++i) {
++            auto& row = rows_[i];
++            if (probe[i]) row.person = people_.lookup(row.person);
++            emit_(row);
++        }
++        size_ = 0;
++    }
+ };
+ 
+ 
+ struct Catalogs {
+     StringMap<size_t> products;
++    memory::Vector<size_t> numbered_products;
+     StringMap<uint32_t> campaign_ids;
+-    std::vector<uint32_t> numbered_campaigns;
+-    std::vector<View> categories{"unknown"};
+-    std::vector<View> campaigns{"organic"}, channels{"organic"};
++    memory::Vector<uint32_t> numbered_campaigns;
++    memory::Vector<View> categories{"unknown"};
++    memory::Vector<View> campaigns{"organic"}, channels{"organic"};
++
++    static int product_number(View s) {
++        if (s.size() < 2 || s.size() > 6 || s[0] != 'p' || (s.size() > 2 && s[1] == '0')) return -1;
++        unsigned number = 0;
++        for (char c : s.substr(1)) {
++            unsigned digit = uint8_t(c) - unsigned('0');
++            if (digit > 9) return -1;
++            number = number * 10 + digit;
++        }
++        return number;
++    }
+ 
+     static int campaign_number(View s) {
+         if (s.size() < 3 || s.size() > 6 || !s.starts_with("c_")) return -1;
+@@ -954,7 +1150,12 @@ struct Catalogs {
+         for (View chunk : product_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
+             auto [where, inserted] = category_ids.try_emplace(f[1], categories.size());
+             if (inserted) categories.push_back(f[1]);
+-            products.emplace(f[0], where->second);
++            if (int number = product_number(f[0]); number >= 0) {
++                if (size_t limit = number + 1; limit > numbered_products.size()) numbered_products.resize(limit);
++                if (!numbered_products[number]) numbered_products[number] = where->second;
++            } else {
++                products.emplace(f[0], where->second);
++            }
+         });
+         for (View chunk : campaign_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
+             campaign_ids.emplace(f[0], campaigns.size());
+@@ -967,6 +1168,8 @@ struct Catalogs {
+         });
+     }
+     size_t category(View product) const {
++        if (int number = product_number(product); number >= 0)
++            return size_t(number) < numbered_products.size() ? numbered_products[number] : 0;
+         auto result = products.find(product);
+         return result == products.end() ? 0 : result->second;
+     }
+@@ -986,8 +1189,6 @@ using CompactEvent = PersonEvent<uint64_t>;
+ template<class Time> struct ClickValue { const char* id; Time time; uint32_t campaign; };
+ template<class Time> using Click = PersonEvent<ClickValue<Time>>;
+ 
+-// The initial field of a validated row ends at its closing quote or comma.
+-// Walk those bytes only on a timestamp tie and compare as unsigned bytes.
+ bool click_id_after(const char* a, const char* b) {
+     for (;;) {
+         uint8_t left = *a++, right = *b++;
+@@ -1013,10 +1214,8 @@ struct CompactCandidate {
+ 
+     CompactCandidate() = default;
+     CompactCandidate(uint64_t id, int64_t ingest, Event<Category> event, const Window& window)
+-        : id(id), ingest(ingest), payload{event.person, event.person
+-            ? uint64_t(event.value.time - window.start) << 32 |
+-              uint64_t(event.value.category) << 24 | event.value.price
+-            : 0} {}
++        : id(id), ingest(ingest), payload{event.person, (uint64_t(event.value.time) - uint64_t(window.start)) << 32 |
++              uint64_t(event.value.category) << 24 | event.value.price} {}
+ };
+ 
+ template<class Index> struct WideCandidate {
+@@ -1043,27 +1242,47 @@ template<class Category> EventValue<Category> unpack(EventValue<Category> value,
+     return value;
+ }
+ 
+-template<class Category>
+-Event<Category> parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
++#include "session_buckets.hpp"
++
++template<class Category, class Row>
++Event<Category> parse_event(const Row& fields, const Window& window, const Catalogs& catalogs,
+                             Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
+     SHOPPING_TIME(timing::Scope validation(timing::Validate, weight);)
+-    if (fields[1].empty() || fields[5].empty()) return {};
+-    bool purchase = fields[4] == "purchase";
+-    if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
+-    int64_t time = window.event_time(fields[2]);
+-    if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
++    const char *user, *product, *type, *ts;
++    size_t user_size = fields.template field<1>(user);
++    size_t product_size = fields.template field<5>(product);
++    unsigned missing = (!user_size) | (!product_size) | (ingest == bad_time);
++    asm("" : "+r"(missing));
++    if (missing) return {};
++    size_t type_size = fields.template field<4>(type);
++    const char* head = type_size >= 4 ? type : "    ";
++    const char* tail = type_size == 8 ? type + 4 : "    ";
++    bool purchase = (type_size == 8) & (std::memcmp(head, "purc", 4) == 0) & (std::memcmp(tail, "hase", 4) == 0);
++    bool interaction = (type_size == 4) & ((std::memcmp(head, "view", 4) == 0) | (std::memcmp(head, "cart", 4) == 0));
++    unsigned valid_type = purchase | interaction;
++    asm("" : "+r"(valid_type));
++    if (!valid_type) return {};
++    size_t ts_size = fields.template field<2>(ts);
++    int64_t time = window.event_time(View(ts, ts_size));
++    uint64_t elapsed = uint64_t(time) - uint64_t(window.start);
++    uint64_t span = uint64_t(window.end) - uint64_t(window.start);
++    unsigned invalid_time = (elapsed >= span) | (time < ingest - day_ms);
++    asm("" : "+r"(invalid_time));
++    if (invalid_time) return {};
+     uint32_t price = 0;
+     Category category = 0;
+     if (purchase) {
+-        int64_t parsed = decimal(fields[6], 10'000'000);
+-        if (parsed <= 0) return {};
+-        price = static_cast<uint32_t>(parsed);
+-        category = static_cast<Category>(catalogs.category(fields[5]));
++        const char* text;
++        size_t size = fields.template field<6>(text);
++        int64_t value = decimal(View(text, size), 10'000'000);
++        if (value <= 0) return {};
++        price = value;
++        category = static_cast<Category>(catalogs.category(View(product, product_size)));
+     }
+     Person person;
+     {
+         SHOPPING_TIME(timing::Scope hash(timing::PersonHash, weight);)
+-        person = ids.key(fields[1]);
++        person = ids.key(View(user, user_size));
+     }
+     return {person, {time, price, category}};
+ }
+@@ -1072,34 +1291,54 @@ template<class Candidate>
+ void read_events(const Input& input, unsigned threads, Trace& trace,
+                  const Window& window, const Catalogs& catalogs, const Input& links, Ids& ids,
+                  std::optional<People>& people, ScatterWorkers<Candidate>& entries, size_t buckets,
+-                 ScatterWorkers<typename Candidate::Survivor>& records, size_t partitions) {
+-    Ids event_ids('e');
++                 ScatterWorkers<typename Candidate::Survivor>& records, size_t partitions, size_t alias_batch) {
++    std::optional<Ids> event_ids(std::in_place, 'e');
++    std::array<int64_t, 8> chunk_ends{};
++    LinkTrace link_trace;
++    const bool measure = trace.enabled();
++    const int64_t ingest_start = measure ? LinkTrace::now() : 0;
+     parallel(threads, input.chunks.size() + 1, [&](unsigned worker, size_t task) {
+         if (task == 0) {
+-            people.emplace(links, ids);
++            if (measure) link_trace.begin = LinkTrace::now();
++            people.emplace(links, ids, measure ? &link_trace : nullptr);
++            if (measure) link_trace.end = LinkTrace::now();
+             return;
+         }
+         SHOPPING_TIME(timing::Scope scanning(timing::Scan);)
+-        scan<7>(input.chunks[task - 1], [&](View, const Fields<7>& fields) {
++        scan_fields<7>(input.chunks[task - 1], [&](const auto& fields) {
+             SHOPPING_TIME(unsigned weight = timing::sample(256);)
+-            if (fields[0].empty()) return;
++            const char* event_id;
++            size_t event_id_size = fields.template field<0>(event_id);
++            if (!event_id_size) return;
+             uint64_t id;
+             {
+                 SHOPPING_TIME(timing::Scope hash(timing::Hash, weight);)
+-                id = event_ids.key(fields[0]);
++                id = event_ids->key(View(event_id, event_id_size));
+             }
+             int64_t ingest;
+             {
+                 SHOPPING_TIME(timing::Scope parse(timing::Parse, weight);)
+-                ingest = window.ingest_time(fields[3].data());
++                const char* clock;
++                size_t size = fields.template field<3>(clock);
++                ingest = window.ingest_time(View(clock, size));
+             }
+             auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest
+                                                                   SHOPPING_TIME(, weight));
+             SHOPPING_TIME(timing::Scope route(timing::Route, weight);)
+             entries[worker]->append(id & (buckets - 1), Candidate(id, ingest, event, window));
+         });
++        if (measure) chunk_ends[worker] = LinkTrace::now();
+     }, [&](unsigned worker) { entries[worker]->finish(); });
++    event_ids.reset();
+     trace.mark("event_ingest_links_catalogs");
++    if (measure) link_trace.report(ingest_start, std::max(ingest_start, *std::max_element(chunk_ends.begin(), chunk_ends.end())));
++    if (memory::settings().release == memory::Release::Early && !ids.has_input_views()) {
++        std::vector<memory::Region> retired;
++        input.take_mappings(retired);
++        links.take_mappings(retired);
++        release_parallel(retired, threads);
++        trace.mark("input_release");
++    }
+ 
+     struct Table {
+         std::vector<uint32_t> positions;
+@@ -1111,12 +1350,13 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         size_t count = 0;
+         for (const auto& batch : entries) count += batch->size(bucket);
+         if (!count) return;
+-        auto emit = [&](const Candidate& winner) {
+-            auto event = winner.payload;
+-            if (!event.person) return;
+-            event.person = people->name(event.person);
++        auto route = [&](const typename Candidate::Survivor& event) {
+             records[worker]->append(event.person & (partitions - 1), event);
+         };
++        PersonBatch<typename Candidate::Survivor, decltype(route)> resolved(*people, alias_batch, route);
++        auto emit = [&](const Candidate& winner) {
++            if (winner.payload.person) resolved.append(winner.payload);
++        };
+         constexpr size_t budget = 512 << 10;
+         constexpr size_t bytes_per_winner = std::bit_ceil(sizeof(Candidate)) + sizeof(const Candidate*);
+         if (count > budget / bytes_per_winner ||
+@@ -1137,6 +1377,7 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+                 }
+                 rows.pop();
+             }
++            resolved.finish();
+             return;
+         }
+         auto& table = tables[worker];
+@@ -1162,31 +1403,44 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+             positions[i] = tag | static_cast<uint32_t>(table.winners.size());
+         });
+         for (auto* winner : table.winners) emit(*winner);
++        resolved.finish();
+     }, [&](unsigned worker) { records[worker]->finish(); });
+     trace.mark("event_dedup_route");
++    std::vector<memory::Region> retired;
++    if (memory::settings().release != memory::Release::None)
++        for (auto& entry : entries) entry->take_mappings(retired);
++    release_parallel(retired, threads);
++    entries.clear();
++    trace.mark("candidate_release");
+ }
+ 
+ template<class Time, class Validate>
+ ScatterWorkers<Click<Time>> read_clicks(const Input& input, unsigned threads, Trace& trace,
+-                                        size_t partitions, Validate validate) {
++                                        size_t partitions, const People& people, size_t alias_batch, Validate validate) {
+     auto records = scatter_workers<Click<Time>>(threads, partitions);
+     parallel(threads, input.chunks.size(), [&](unsigned worker, size_t task) {
+-        scan<4>(input.chunks[task], [&](View, const Fields<4>& fields) {
+-            if (!fields[0].empty()) validate(fields, *records[worker]);
++        auto route = [&](const Click<Time>& click) {
++            records[worker]->append(click.person & (partitions - 1), click);
++        };
++        PersonBatch<Click<Time>, decltype(route)> resolved(people, alias_batch, route);
++        scan_fields<4>(input.chunks[task], [&](const auto& fields) {
++            const char* id;
++            if (fields.template field<0>(id)) validate(id, fields, resolved);
+         });
++        resolved.finish();
+     }, [&](unsigned worker) { records[worker]->finish(); });
+     trace.mark("click_scan_validation");
+     return records;
+ }
+ 
+ template<class T> class ScratchArray {
+-    std::unique_ptr<T[]> data_;
++    memory::Array<T> data_;
+     size_t capacity_ = 0;
+ public:
+     T* resize(size_t count) {
+         if (count > capacity_) {
+             capacity_ = std::bit_ceil(count);
+-            data_ = std::make_unique_for_overwrite<T[]>(capacity_);
++            data_ = memory::array<T>(capacity_);
+         }
+         return data_.get();
+     }
+@@ -1196,28 +1450,34 @@ public:
+ struct PersonTableFull {};
+ 
+ template<class Value, class Time, class Index> struct Timelines {
++    using Category = decltype(unpack(std::declval<Value>(), std::declval<const Window&>()).category);
+     struct PersonRange { Person person; Index begin, end, click_begin, click_end; };
+     struct Slot { Person person; Index index, count; };
+     std::vector<PersonRange> people;
+     ScratchArray<Value> values, staged;
+     ScratchArray<ClickValue<Time>> clicks;
+     ScratchArray<Index> local_ids, click_ids;
++    ScratchArray<uint64_t> keys, by_bucket;
++    memory::Vector<SessionPurchase<Category>> purchases;
++    std::vector<Index> bucket_offsets;
+     std::vector<Index> event_offsets;
+-    std::vector<Slot> table;
++    memory::Vector<Slot> table;
+ };
+ 
+-template<class Value, class Time, class Index>
++template<bool Bucketed, class Value, class Time, class Index>
+ void collect_timelines(Timelines<Value, Time, Index>& result,
+                        const ScatterWorkers<PersonEvent<Value>>& sources,
+                        const ScatterWorkers<Click<Time>>& click_sources,
+-                       size_t bucket, size_t total, size_t click_count, unsigned partition_bits) {
++                       size_t bucket, size_t total, size_t click_count, unsigned partition_bits,
++                       const Window& window, const BucketLayout& layout, size_t few_clicks = 0) {
+     auto& people = result.people;
+     auto& table = result.table;
+     auto& offsets = result.event_offsets;
+     people.clear();
+     offsets.clear();
+     using Slot = typename Timelines<Value, Time, Index>::Slot;
+-    constexpr size_t max_slots = 1024;
++    size_t max_people = Bucketed ? std::min(total, layout.person_limit()) : 768;
++    size_t max_slots = std::max<size_t>(32, std::bit_ceil((max_people * 4 + 2) / 3));
+     size_t table_size = std::clamp<size_t>(std::bit_ceil(total / 16 + 1), 32, max_slots);
+     table.assign(table_size, Slot{});
+     auto find = [partition_bits](auto& slots, Person person) -> Slot& {
+@@ -1229,9 +1489,9 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+     auto add = [&](Person person) -> Slot& {
+         auto* slot = &find(table, person);
+         if (slot->person) return *slot;
++        if (people.size() == max_people) throw PersonTableFull{};
+         if (people.size() == table.size() * 3 / 4) {
+-            if (table.size() == max_slots) throw PersonTableFull{};
+-            std::vector<Slot> grown(table.size() * 2);
++            memory::Vector<Slot> grown(table.size() * 2);
+             for (auto entry : table) if (entry.person) find(grown, entry.person) = entry;
+             table.swap(grown);
+             slot = &find(table, person);
+@@ -1241,14 +1501,31 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+         return *slot;
+     };
+ 
+-    auto* local_ids = result.local_ids.resize(total);
+-    auto* staged = result.staged.resize(total);
++    auto* local_ids = Bucketed ? nullptr : result.local_ids.resize(total);
++    auto* staged = Bucketed ? nullptr : result.staged.resize(total);
++    auto* keys = Bucketed ? result.keys.resize(total) : nullptr;
++    if constexpr (Bucketed) {
++        result.bucket_offsets.assign(layout.count, 0);
++        result.purchases.clear();
++    }
+     size_t row_index = 0;
+     for (const auto& batch : sources) batch->visit(bucket, [&](const auto& row) {
+         auto& slot = add(row.person);
+         ++slot.count;
+-        staged[row_index] = row.value;
+-        local_ids[row_index++] = slot.index;
++        if constexpr (Bucketed) {
++            auto event = unpack(row.value, window);
++            uint32_t time;
++            if constexpr (std::is_same_v<Value, uint64_t>) time = row.value >> 32;
++            else time = uint64_t(event.time) - uint64_t(window.start);
++            uint32_t time_bucket = time / gap_ms;
++            ++result.bucket_offsets[time_bucket];
++            keys[row_index++] = layout.key(slot.index, time_bucket, time);
++            if (event.price) result.purchases.push_back({(uint64_t(slot.index) << 32) | time,
++                                                        event.price, event.category});
++        } else {
++            staged[row_index] = row.value;
++            local_ids[row_index++] = slot.index;
++        }
+     });
+     offsets.resize(people.size());
+     for (auto slot : table) if (slot.person) offsets[slot.index] = slot.count;
+@@ -1272,8 +1549,15 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+         next_click += range.click_end;
+         range.click_end = range.click_begin;
+     }
+-    auto* values = result.values.resize(total);
+-    for (size_t i = 0; i < total; ++i) values[offsets[local_ids[i]]++] = staged[i];
++    if constexpr (Bucketed) {
++        bucket_scatter(layout, keys, result.by_bucket.resize(total), total, result.bucket_offsets, offsets);
++        std::sort(result.purchases.begin(), result.purchases.end(),
++                  [](const auto& a, const auto& b) { return a.key < b.key; });
++    } else {
++        auto* values = result.values.resize(total);
++        for (size_t i = 0; i < total; ++i) values[offsets[local_ids[i]]++] = staged[i];
++        for (const auto& range : people) sort_timeline(values + range.begin, values + range.end);
++    }
+     auto* clicks = result.clicks.resize(next_click);
+     row_index = 0;
+     for (const auto& batch : click_sources) batch->visit(bucket, [&](const auto& row) {
+@@ -1281,8 +1565,7 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+         if (id != absent) clicks[people[id].click_end++] = row.value;
+     });
+     for (const auto& range : people) {
+-        sort_timeline(values + range.begin, values + range.end);
+-        if (range.click_end - range.click_begin > 1)
++        if (range.click_end - range.click_begin > std::max<size_t>(1, few_clicks))
+             std::sort(clicks + range.click_begin, clicks + range.click_end,
+                       [](const auto& a, const auto& b) {
+                           return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
+@@ -1296,6 +1579,7 @@ template<class Category> struct UserDaily {
+     Category category;
+     int64_t sessions = 0, events = 0, revenue = 0;
+ };
++template<class Category> class UserOutput;
+ struct CampaignDaily { int64_t sessions = 0, purchases = 0, revenue = 0, assists = 0; };
+ 
+ uint64_t campaign_key(int32_t day, uint32_t campaign) {
+@@ -1305,8 +1589,8 @@ uint64_t campaign_key(int32_t day, uint32_t campaign) {
+ class CampaignTotals {
+     int32_t start_;
+     size_t campaigns_;
+-    std::vector<CampaignDaily> dense_;
+-    std::unordered_map<uint64_t, CampaignDaily> sparse_;
++    memory::Vector<CampaignDaily> dense_;
++    memory::Map<uint64_t, CampaignDaily> sparse_;
+ 
+ public:
+     CampaignTotals(const Window& window, size_t campaigns)
+@@ -1355,74 +1639,87 @@ template<class Category> struct AttributionScratch {
+     }
+ };
+ 
+-template<class EventCursor, class ClickCursor, class Category>
+-void aggregate_person(Person person, EventCursor events, ClickCursor first, ClickCursor last,
++template<bool Few = false, class Sessions, class ClickCursor, class Category>
++void aggregate_person(Person person, Sessions sessions, ClickCursor first, ClickCursor last,
+                       const Catalogs& catalogs, const Window& window, CampaignTotals& totals,
+-                      std::vector<UserDaily<Category>>& users, AttributionScratch<Category>& scratch) {
++                      UserOutput<Category>& users, AttributionScratch<Category>& scratch) {
+     constexpr bool sparse_categories = AttributionScratch<Category>::sparse_categories;
+     auto& [spend, bought, counts, positions, active] = scratch;
+     using Time = decltype(last.front().time);
+-    auto at = [&] { return unpack(events.front(), window); };
+     SHOPPING_TIME(unsigned weight = timing::sample(64);)
+     uint32_t latest = 0;
+     do {
+-        int32_t day = utc_day(at().time);
++        int32_t day = utc_day(sessions.start());
+         UserDaily<Category> daily{person, day, no_category<Category>};
+         auto* day_campaigns = totals.day(day);
+         do {
+-            int64_t start = at().time;
+-            int64_t previous = start, revenue = 0;
+-            do {
+-                const auto row = at();
+-                events.pop();
+-                previous = row.time;
+-                ++daily.events;
+-                if (row.price) {
+-                    auto& category_spend = spend[row.category];
+-                    if (!category_spend) bought.push_back(row.category);
+-                    category_spend += row.price;
+-                    revenue += row.price;
+-                }
+-            } while (!events.empty() && uint64_t(at().time) - uint64_t(previous) <= gap_ms);
++            int64_t start = sessions.start(), revenue = 0;
++            daily.events += sessions.take([&](uint32_t price, Category category) {
++                auto& category_spend = spend[category];
++                if (!category_spend) bought.push_back(category);
++                category_spend += price;
++                revenue += price;
++            });
+             ++daily.sessions;
+             daily.revenue += revenue;
+ 
+             SHOPPING_TIME(timing::Scope attribution(timing::Attribution, weight);)
+             const int64_t click_start = std::is_unsigned_v<Time> ? start - (window.start - week_ms) : start;
+-            const int64_t lower = click_start - week_ms;
+-            while (first.position() != last.position() && first.front().time < lower) {
+-                uint32_t campaign = first.front().campaign;
+-                first.pop();
+-                if (--counts[campaign] == 0) {
+-                    uint32_t tail = active.back();
+-                    active[positions[campaign]] = tail;
+-                    positions[tail] = positions[campaign];
+-                    active.pop_back();
++            uint32_t winner = 0;
++            if constexpr (Few) {
++                const char* best_id = nullptr;
++                int64_t best_time = INT64_MIN;
++                for (auto click = first; !click.empty(); click.pop()) {
++                    const auto& row = click.front();
++                    if (uint64_t(click_start) - uint64_t(row.time) > week_ms) continue;
++                    if (!counts[row.campaign]) {
++                        active.push_back(row.campaign);
++                        counts[row.campaign] = 1;
++                    }
++                    if (row.time > best_time || (row.time == best_time && (!best_id || click_id_after(best_id, row.id)))) {
++                        best_time = row.time;
++                        best_id = row.id;
++                        winner = row.campaign;
++                    }
+                 }
+-            }
+-            while (!last.empty() && last.front().time <= click_start) {
+-                auto row = last.front();
+-                last.pop();
+-                if (row.time < lower) {
++            } else {
++                const int64_t lower = click_start - week_ms;
++                while (first.position() != last.position() && first.front().time < lower) {
++                    uint32_t campaign = first.front().campaign;
+                     first.pop();
+-                    continue;
++                    if (--counts[campaign] == 0) {
++                        uint32_t tail = active.back();
++                        active[positions[campaign]] = tail;
++                        positions[tail] = positions[campaign];
++                        active.pop_back();
++                    }
+                 }
+-                uint32_t campaign = latest = row.campaign;
+-                if (counts[campaign]++ == 0) {
+-                    positions[campaign] = active.size();
+-                    active.push_back(campaign);
++                while (!last.empty() && last.front().time <= click_start) {
++                    auto row = last.front();
++                    last.pop();
++                    if (row.time < lower) {
++                        first.pop();
++                        continue;
++                    }
++                    uint32_t campaign = latest = row.campaign;
++                    if (counts[campaign]++ == 0) {
++                        positions[campaign] = active.size();
++                        active.push_back(campaign);
++                    }
+                 }
++                winner = first.position() != last.position() ? latest : 0;
+             }
+-            uint32_t winner = first.position() != last.position() ? latest : 0;
+             auto& credit = day_campaigns ? day_campaigns[winner] : totals[campaign_key(day, winner)];
+             ++credit.sessions;
+             credit.purchases += revenue != 0;
+             credit.revenue += revenue;
+-            if (day_campaigns) {
+-                for (uint32_t campaign : active) ++day_campaigns[campaign].assists;
+-            } else
+-                for (uint32_t campaign : active) ++totals[campaign_key(day, campaign)].assists;
+-        } while (!events.empty() && utc_day(at().time) == day);
++            for (uint32_t campaign : active) {
++                if (day_campaigns) ++day_campaigns[campaign].assists;
++                else ++totals[campaign_key(day, campaign)].assists;
++                if constexpr (Few) counts[campaign] = 0;
++            }
++            if constexpr (Few) active.clear();
++        } while (!sessions.empty() && utc_day(sessions.start()) == day);
+ 
+         int64_t high = 0;
+         for (Category category : bought) {
+@@ -1436,30 +1733,42 @@ void aggregate_person(Person person, EventCursor events, ClickCursor first, Clic
+             else spend[category] = 0;
+         }
+         bought.clear();
+-        users.push_back(daily);
+-    } while (!events.empty());
++        users.append(daily);
++    } while (!sessions.empty());
+     for (uint32_t campaign : active) counts[campaign] = 0;
+     active.clear();
+ }
+ 
+-template<class Value, class Time, class Index, class Category>
++template<bool Bucketed, class Value, class Time, class Index, class Category>
+ void aggregate(const Timelines<Value, Time, Index>& timelines, const Catalogs& catalogs,
+-               const Window& window, CampaignTotals& totals, std::vector<UserDaily<Category>>& users,
+-               AttributionScratch<Category>& scratch) {
+-    const auto* values = timelines.values.get();
++               const Window& window, CampaignTotals& totals, UserOutput<Category>& users,
++               AttributionScratch<Category>& scratch, size_t few_clicks) {
+     const auto* clicks = timelines.clicks.get();
+-    for (auto [person, begin, end, click_begin, click_end] : timelines.people) {
+-        SpanCursor<Value> events{values, begin, end};
++    std::span<const SessionPurchase<Category>> purchases(timelines.purchases);
++    for (size_t index = 0; index < timelines.people.size(); ++index) {
++        auto [person, begin, end, click_begin, click_end] = timelines.people[index];
+         SpanCursor<ClickValue<Time>> range{clicks, click_begin, click_end};
+-        aggregate_person(person, events, range, range, catalogs, window, totals, users, scratch);
++        auto consume = [&](auto sessions) {
++            if (few_clicks && click_end - click_begin <= few_clicks)
++                aggregate_person<true>(person, sessions, range, range, catalogs, window, totals, users, scratch);
++            else
++                aggregate_person(person, sessions, range, range, catalogs, window, totals, users, scratch);
++        };
++        if constexpr (Bucketed) {
++            auto* keys = timelines.keys.get();
++            consume(BucketSessions(std::span(keys + begin, end - begin), purchases, index, window.start));
++        } else {
++            SpanCursor<Value> events{timelines.values.get(), begin, end};
++            consume(SortedSessions(events, window));
++        }
+     }
+ }
+ 
+ template<class Value, class Time, class Category>
+ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const ScatterWorkers<Click<Time>>& clicks,
+                     size_t bucket, const Catalogs& catalogs, const Window& window,
+-                    CampaignTotals& totals, std::vector<UserDaily<Category>>& users,
+-                    AttributionScratch<Category>& scratch) {
++                    CampaignTotals& totals, UserOutput<Category>& users,
++                    AttributionScratch<Category>& scratch, GroupTrace* group_trace, size_t few_clicks) {
+     Person frequent = 0;
+     size_t votes = 0;
+     for (const auto& batch : sources) if (const auto* row = batch->first(bucket)) {
+@@ -1483,21 +1792,41 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+     uint64_t span = uint64_t(window.end) - uint64_t(window.start);
+     std::optional<TimeRuns<Value, decltype(event_value_less)>> frequent_events;
+     std::optional<TimeRuns<ClickValue<Time>, decltype(click_value_less)>> frequent_clicks;
+-    if (frequent) {
+-        frequent_events.emplace(span, event_value_less);
+-        frequent_clicks.emplace(span + week_ms, click_value_less);
+-    }
++    if (frequent) frequent_events.emplace(span, event_value_less);
++    struct ClickRange { size_t count = 0, end = 0; };
++    memory::Map<Person, ClickRange> click_ranges;
++    ScratchArray<ClickValue<Time>> direct_clicks;
++    auto direct = [&](const ClickRange& range) { return few_clicks && range.count <= few_clicks; };
+     {
++        GroupTrace::Scope measured{group_trace};
+         SHOPPING_TIME(timing::Scope group(timing::Group);)
++        if (frequent) click_ranges.try_emplace(frequent);
+         for (const auto& batch : sources) batch->visit(bucket, [&](const auto& row) {
+             if (row.person == frequent) {
+                 auto offset = uint64_t(unpack(row.value, window).time) - uint64_t(window.start);
+                 frequent_events->append(offset, row.value);
+             } else {
+                 event_runs.append(row);
++                click_ranges.try_emplace(row.person);
+             }
+         });
++        if (few_clicks) for (const auto& batch : clicks) batch->visit(bucket, [&](const auto& row) {
++            if (auto info = click_ranges.find(row.person); info != click_ranges.end()) ++info->second.count;
++        });
++        size_t small_count = 0;
++        for (auto& [person, range] : click_ranges) if (direct(range)) {
++            range.end = small_count;
++            small_count += range.count;
++        }
++        auto* small = direct_clicks.resize(small_count);
++        if (frequent && !direct(click_ranges.at(frequent))) frequent_clicks.emplace(span + week_ms, click_value_less);
+         for (const auto& batch : clicks) batch->visit(bucket, [&](const auto& row) {
++            auto info = click_ranges.find(row.person);
++            if (info == click_ranges.end()) return;
++            if (direct(info->second)) {
++                small[info->second.end++] = row.value;
++                return;
++            }
+             if (row.person == frequent) {
+                 uint64_t offset = row.value.time;
+                 if constexpr (std::is_signed_v<Time>) offset -= uint64_t(window.start - week_ms);
+@@ -1508,16 +1837,22 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+         });
+         event_runs.finish();
+         click_runs.finish();
+-        if (frequent) {
+-            frequent_events->finish();
+-            frequent_clicks->finish();
+-        }
++        if (frequent_events) frequent_events->finish();
++        if (frequent_clicks) frequent_clicks->finish();
+     }
+ 
+     SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
++    auto consume_few = [&](Person person, auto sessions, const ClickRange& info) {
++        SpanCursor<ClickValue<Time>> range{direct_clicks.get(), info.end - info.count, info.end};
++        aggregate_person<true>(person, sessions, range, range, catalogs, window, totals, users, scratch);
++    };
+     if (frequent) {
+-        aggregate_person(frequent, frequent_events->cursor(), frequent_clicks->cursor(), frequent_clicks->cursor(),
+-                         catalogs, window, totals, users, scratch);
++        auto sessions = SortedSessions(frequent_events->cursor(), window);
++        if (frequent_clicks)
++            aggregate_person(frequent, std::move(sessions), frequent_clicks->cursor(), frequent_clicks->cursor(),
++                             catalogs, window, totals, users, scratch);
++        else
++            consume_few(frequent, std::move(sessions), click_ranges.at(frequent));
+     }
+     auto events = event_runs.cursor();
+     auto first = click_runs.cursor(), last = click_runs.cursor();
+@@ -1526,10 +1861,16 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+         auto skip = [person](auto& cursor) {
+             while (!cursor.empty() && cursor.front().person < person) cursor.pop();
+         };
+-        skip(first);
+-        skip(last);
+-        aggregate_person(person, PersonCursor{events, person}, PersonCursor{first, person},
+-                         PersonCursor{last, person}, catalogs, window, totals, users, scratch);
++        auto sessions = SortedSessions(PersonCursor{events, person}, window);
++        const auto& info = click_ranges.at(person);
++        if (direct(info)) {
++            consume_few(person, sessions, info);
++        } else {
++            skip(first);
++            skip(last);
++            aggregate_person(person, sessions, PersonCursor{first, person}, PersonCursor{last, person},
++                             catalogs, window, totals, users, scratch);
++        }
+     }
+ }
+ 
+@@ -1541,70 +1882,79 @@ constexpr Column campaign_schema[] = {{"campaign_id", Column::Text, 0}, {"channe
+     {"day", Column::Int32, 6}, {"sessions", Column::Int64}, {"purchasing_sessions", Column::Int64},
+     {"revenue_cents", Column::Int64}, {"assisted_sessions", Column::Int64}};
+ 
+-size_t longest_string(const std::vector<View>& strings) {
++size_t longest_string(const memory::Vector<View>& strings) {
+     size_t length = 0;
+     for (View value : strings) length = std::max(length, value.size());
+     return length;
+ }
+ 
+-template<class Category>
+-void write_users(parquet::File& file, std::span<const UserDaily<Category>> users, const Catalogs& catalogs,
+-                 const Ids& ids, size_t group_rows) {
+-    using parquet::little_endian;
+-    using parquet::plain;
+-    while (!users.empty()) {
+-        auto group = users.first(std::min(group_rows, users.size()));
+-        file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
+-            if (column == 5) parquet::definitions(bytes, group.size(), [&](size_t i) {
+-                return group[i].category != no_category<Category>;
+-            });
+-            for (const auto& row : group) {
+-                switch (column) {
+-                    case 0: {
+-                        char buffer[9];
+-                        plain(bytes, ids.name(row.user, buffer));
+-                        break;
+-                    }
+-                    case 1: little_endian(bytes, row.day); break;
+-                    case 2: little_endian(bytes, row.sessions); break;
+-                    case 3: little_endian(bytes, row.events); break;
+-                    case 4: little_endian(bytes, row.revenue); break;
+-                    case 5:
+-                        if (row.category != no_category<Category>) plain(bytes, catalogs.categories[row.category]);
+-                        break;
+-                }
+-            }
+-        });
+-        users = users.subspan(group.size());
++template<class Category> class UserOutput {
++    const Catalogs& catalogs_;
++    const Ids& ids_;
++    fs::path path_;
++    size_t group_rows_, count_ = 0;
++    std::array<parquet::Page, std::size(user_schema)> columns_;
++    std::unique_ptr<parquet::File> file_;
++
++    void flush() {
++        if (!file_) file_ = std::make_unique<parquet::File>(path_, user_schema);
++        file_->append(count_, columns_);
++        count_ = 0;
++    }
++
++public:
++    UserOutput(const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows)
++        : catalogs_(catalogs), ids_(ids), path_(std::move(path)), group_rows_(group_rows) {}
++
++    void append(const UserDaily<Category>& row) {
++        using parquet::little_endian;
++        using parquet::plain;
++        char buffer[9];
++        plain(columns_[0].values, ids_.name(row.user, buffer));
++        little_endian(columns_[1].values, row.day);
++        little_endian(columns_[2].values, row.sessions);
++        little_endian(columns_[3].values, row.events);
++        little_endian(columns_[4].values, row.revenue);
++        auto& category = columns_[5];
++        if ((count_ & 7) == 0) category.present.push_back(0);
++        if (row.category != no_category<Category>) {
++            category.present.back() |= uint8_t{1} << (count_ & 7);
++            plain(category.values, catalogs_.categories[row.category]);
++        }
++        if (++count_ == group_rows_) flush();
+     }
+-}
++
++    bool empty() const { return !file_ && !count_; }
++
++    void finish(bool force_empty) {
++        if (count_ || force_empty) flush();
++        if (file_) file_->finish();
++    }
++};
+ 
+ void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs) {
+     SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+     using parquet::little_endian;
+     using parquet::plain;
+-    std::vector<std::pair<uint64_t, const CampaignDaily*>> rows;
++    memory::Vector<std::pair<uint64_t, const CampaignDaily*>> rows;
+     totals.each([&](uint64_t key, const CampaignDaily& row) { rows.emplace_back(key, &row); });
+     parquet::File file(path, campaign_schema);
+     size_t group_rows = parquet::row_group_limit(
+         std::max(longest_string(catalogs.campaigns), longest_string(catalogs.channels)));
+     for (size_t offset = 0; offset < rows.size(); offset += group_rows) {
+         auto group = std::span(rows).subspan(offset, std::min(group_rows, rows.size() - offset));
+-        file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
+-            for (auto [key, values] : group) {
+-                uint32_t campaign = key;
+-                const auto& row = *values;
+-                switch (column) {
+-                    case 0: plain(bytes, catalogs.campaigns[campaign]); break;
+-                    case 1: plain(bytes, catalogs.channels[campaign]); break;
+-                    case 2: little_endian(bytes, static_cast<int32_t>(key >> 32)); break;
+-                    case 3: little_endian(bytes, row.sessions); break;
+-                    case 4: little_endian(bytes, row.purchases); break;
+-                    case 5: little_endian(bytes, row.revenue); break;
+-                    case 6: little_endian(bytes, row.assists); break;
+-                }
+-            }
+-        });
++        std::array<parquet::Page, std::size(campaign_schema)> columns;
++        for (auto [key, values] : group) {
++            uint32_t campaign = key;
++            plain(columns[0].values, catalogs.campaigns[campaign]);
++            plain(columns[1].values, catalogs.channels[campaign]);
++            little_endian(columns[2].values, static_cast<int32_t>(key >> 32));
++            little_endian(columns[3].values, values->sessions);
++            little_endian(columns[4].values, values->purchases);
++            little_endian(columns[5].values, values->revenue);
++            little_endian(columns[6].values, values->assists);
++        }
++        file.append(group.size(), columns);
+     }
+     file.finish();
+ }
+@@ -1614,11 +1964,13 @@ std::string env(const char* key, const char* fallback) {
+     return value && *value ? value : fallback;
+ }
+ 
+-uint64_t positive_env(const char* key, const char* fallback) {
+-    auto text = env(key, fallback);
++uint64_t number_env(const char* key, uint64_t fallback, uint64_t minimum = 1) {
++    const char* setting = std::getenv(key);
++    if (!setting || !*setting) return fallback;
++    View text(setting);
+     uint64_t value = 0;
+     auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+-    if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || !value)
++    if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || value < minimum)
+         throw std::runtime_error(std::string("invalid ") + key);
+     return value;
+ }
+@@ -1631,24 +1983,33 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     std::optional<People> people;
+     using Survivor = typename Candidate::Survivor;
+     size_t buckets = partition_override("SHOPPING_EVENT_BUCKETS",
+-        partition_size(event_input.bytes, 72, 192'000 / sizeof(Candidate)));
++        partition_size(event_input.bytes, 72,
++                       number_env("SHOPPING_EVENT_BUCKET_ROWS", 192'000 / sizeof(Candidate))));
+     size_t partitions = partition_override("SHOPPING_PERSON_PARTITIONS",
+-        partition_size(event_input.bytes + click_input.bytes, 72, 12'000));
++        partition_size(event_input.bytes + click_input.bytes, 72,
++                       number_env("SHOPPING_PERSON_PARTITION_ROWS", 12'000)));
++    size_t alias_batch = std::min<uint64_t>(max_alias_batch, number_env("SHOPPING_ALIAS_BATCH", 32, 0));
+     auto entries = scatter_workers<Candidate>(threads, buckets);
+     auto events = scatter_workers<Survivor>(threads, partitions);
+-    read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, events, partitions);
++    read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, events,
++                partitions, alias_batch);
+     if (setting("SHOPPING_TRACE", false))
+         std::fprintf(stderr, "partitions %zu %zu\n", buckets, partitions);
+     using ClickTime = std::conditional_t<std::is_same_v<Candidate, CompactCandidate>, uint32_t, int64_t>;
+-    auto clicks = read_clicks<ClickTime>(click_input, threads, trace, partitions, [&](const Fields<4>& f, auto& batch) {
+-        if (f[1].empty()) return;
+-        int64_t time = window.event_time(f[3]);
++    auto clicks = read_clicks<ClickTime>(click_input, threads, trace, partitions, *people, alias_batch,
++                                       [&](const char* id, const auto& f, auto& batch) {
++        const char *user, *ts, *campaign_id;
++        size_t user_size = f.template field<1>(user);
++        if (!user_size) return;
++        size_t ts_size = f.template field<3>(ts);
++        int64_t time = window.event_time(View(ts, ts_size));
+         if (time < window.start - week_ms || time >= window.end) return;
+-        uint32_t campaign = catalogs.campaign(f[2]);
++        size_t campaign_size = f.template field<2>(campaign_id);
++        uint32_t campaign = catalogs.campaign(View(campaign_id, campaign_size));
+         if (!campaign) return;
+-        Person person = people->name(ids.key(f[1]));
++        Person person = ids.key(View(user, user_size));
+         if constexpr (std::is_unsigned_v<ClickTime>) time -= window.start - week_ms;
+-        batch.append(person & (partitions - 1), {person, {f[0].data(), static_cast<ClickTime>(time), campaign}});
++        batch.append({person, {id, static_cast<ClickTime>(time), campaign}});
+     });
+ 
+     fs::create_directories(out / "user_daily");
+@@ -1657,19 +2018,27 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+         std::max(ids.longest(), longest_string(catalogs.categories)));
+     using Category = typename Candidate::Category;
+     using Value = decltype(Survivor::value);
++    auto layout = BucketLayout::for_span(uint64_t(window.end) - uint64_t(window.start));
++    size_t bucket_minimum = number_env("SHOPPING_BUCKET_MIN_EVENTS", 128);
++    size_t few_clicks = number_env("SHOPPING_FEW_CLICKS", 16, 0);
++    bool bucket_sessions = layout.count && !setting("SHOPPING_FORCE_SORT", false);
++    auto partition_bits = std::countr_zero(partitions);
+     struct Worker {
+-        std::unique_ptr<parquet::File> writer;
+         CampaignTotals campaigns;
+         AttributionScratch<Category> attribution;
+         Timelines<Value, ClickTime, uint32_t> timelines;
+-        std::vector<UserDaily<Category>> users;
++        UserOutput<Category> users;
++        GroupTrace group;
+ 
+-        Worker(const Window& window, const Catalogs& catalogs)
+-            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs) {}
++        Worker(const Window& window, const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows)
++            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs),
++              users(catalogs, ids, std::move(path), group_rows) {}
+     };
+     std::vector<Worker> workers;
+     workers.reserve(threads);
+-    for (unsigned i = 0; i < threads; ++i) workers.emplace_back(window, catalogs);
++    for (unsigned i = 0; i < threads; ++i)
++        workers.emplace_back(window, catalogs, ids, out / "user_daily" / ("part-" + std::to_string(i) + ".parquet"),
++                             user_group_rows);
+     std::vector<size_t> jobs(partitions), event_counts(partitions), click_counts(partitions);
+     for (size_t bucket = 0; bucket < partitions; ++bucket) {
+         jobs[bucket] = bucket;
+@@ -1678,56 +2047,73 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     }
+     std::sort(jobs.begin(), jobs.end(),
+               [&](size_t a, size_t b) { return event_counts[a] > event_counts[b]; });
+-    auto flush_users = [&](Worker& state, unsigned worker, size_t count) {
+-        SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+-        if (!state.writer) state.writer = std::make_unique<parquet::File>(out / "user_daily" /
+-            ("part-" + std::to_string(worker) + ".parquet"), user_schema);
+-        write_users<Category>(*state.writer, std::span(state.users).first(count), catalogs, ids, user_group_rows);
+-        state.users.erase(state.users.begin(), state.users.begin() + count);
+-    };
+     parallel(threads, partitions, [&](unsigned worker, size_t task) {
+         size_t bucket = jobs[task], count = event_counts[bucket], click_count = click_counts[bucket];
+         if (!count) return;
+         auto& state = workers[worker];
+-        auto consume = [&](auto& timelines) {
++        auto* group = trace.enabled() ? &state.group : nullptr;
++        auto consume = [&]<bool Bucketed>() {
+             {
++                GroupTrace::Scope measured{group};
+                 SHOPPING_TIME(timing::Scope group(timing::Group);)
+-                collect_timelines(timelines, events, clicks, bucket, count, click_count, std::countr_zero(partitions));
++                collect_timelines<Bucketed>(state.timelines, events, clicks, bucket, count, click_count,
++                                            partition_bits, window, layout, few_clicks);
+             }
+             SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
+-            aggregate(timelines, catalogs, window, state.campaigns, state.users, state.attribution);
++            aggregate<Bucketed>(state.timelines, catalogs, window, state.campaigns, state.users, state.attribution,
++                                few_clicks);
+         };
+         constexpr size_t event_bytes = std::bit_ceil(sizeof(Survivor)) + 2 * sizeof(Value) + sizeof(uint32_t);
+         constexpr size_t click_bytes = std::bit_ceil(sizeof(Click<ClickTime>)) + sizeof(ClickValue<ClickTime>) + sizeof(uint32_t);
+         constexpr size_t record_budget = 448 << 10;
+         auto oversized = [&] {
+-            aggregate_runs(events, clicks, bucket, catalogs, window, state.campaigns, state.users, state.attribution);
++            aggregate_runs(events, clicks, bucket, catalogs, window, state.campaigns, state.users,
++                           state.attribution, group, few_clicks);
+         };
+-        if (count > record_budget / event_bytes ||
+-            click_count > (record_budget - count * event_bytes) / click_bytes) {
+-            oversized();
+-        } else {
++        bool bucketed = false;
++        if (bucket_sessions && count >= bucket_minimum && count <= UINT32_MAX && click_count <= UINT32_MAX) {
+             try {
+-                consume(state.timelines);
++                consume.template operator()<true>();
++                bucketed = true;
+             } catch (const PersonTableFull&) {
++            }
++        }
++        if (!bucketed) {
++            if (count > record_budget / event_bytes ||
++                click_count > (record_budget - count * event_bytes) / click_bytes) {
+                 oversized();
++            } else {
++                try {
++                    consume.template operator()<false>();
++                } catch (const PersonTableFull&) {
++                    oversized();
++                }
+             }
+         }
+-        if (size_t complete = state.users.size() / user_group_rows)
+-            flush_users(state, worker, complete * user_group_rows);
++        if (group) {
++            group->bucket_partitions += bucketed;
++            group->sorted_partitions += !bucketed;
++            group->bucket_rows += bucketed ? count : 0;
++        }
+     });
+     trace.mark("sessions_user_output");
++    if (trace.enabled()) {
++        GroupTrace group;
++        for (const auto& worker : workers) {
++            group.cpu_ns += worker.group.cpu_ns;
++            group.bucket_partitions += worker.group.bucket_partitions;
++            group.sorted_partitions += worker.group.sorted_partitions;
++            group.bucket_rows += worker.group.bucket_rows;
++        }
++        std::fprintf(stderr, "group cpu_ms %.3f bucket_partitions %zu sorted_partitions %zu bucket_rows %zu\n",
++                     double(group.cpu_ns) / 1e6, group.bucket_partitions, group.sorted_partitions, group.bucket_rows);
++    }
+ 
+-    if (std::none_of(workers.begin(), workers.end(), [](const auto& worker) {
+-            return worker.writer || !worker.users.empty();
+-        }))
+-        workers[0].writer = std::make_unique<parquet::File>(out / "user_daily" / "part-0.parquet", user_schema);
++    bool empty = std::all_of(workers.begin(), workers.end(), [](const auto& worker) { return worker.users.empty(); });
+     parallel(threads, threads + 1, [&](unsigned, size_t task) {
+         if (task) {
+-            auto& state = workers[task - 1];
+-            if (!state.users.empty()) flush_users(state, task - 1, state.users.size());
+             SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+-            if (state.writer) state.writer->finish();
++            workers[task - 1].users.finish(empty && task == 1);
+             return;
+         }
+         auto& totals = workers.front().campaigns;
+@@ -1736,16 +2122,17 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     });
+     trace.mark("finish");
+     SHOPPING_TIME(timing::report();)
+-    // Same code in the profiling and the final build: the profile writers are
+-    // weak symbols that exist only when the binary is instrumented.
+     if (__gcov_dump) __gcov_dump();
+     if (__llvm_profile_write_file) __llvm_profile_write_file();
+-    if (!setting("SHOPPING_UNMAP", false)) _exit(0);
++    if (setting("SHOPPING_UNMAP", false)) return;
++    if (memory::settings().release != memory::Release::None) release_parallel(memory::take_all(), threads);
++    trace.mark("exit_release");
++    _exit(0);
+ }
+ 
+ int main(int argc, char** argv) try {
+     Trace trace;
+-    unsigned threads = std::min<uint64_t>(8, positive_env("NCPU", "8"));
++    unsigned threads = std::min<uint64_t>(8, number_env("NCPU", 8));
+     fs::path data = argc > 1 ? argv[1] : env("DATA_DIR", "/data");
+     fs::path out = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
+     const Window window(data / "manifest.json");
+diff --git a/parquet.hpp b/parquet.hpp
+index 0818175..f2e9a29 100644
+--- a/parquet.hpp
++++ b/parquet.hpp
+@@ -1,9 +1,11 @@
+ #pragma once
+ 
+ #include "detail_trace.hpp"
++#include "large_memory.hpp"
+ 
+ #include <algorithm>
+ #include <bit>
++#include <cerrno>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+@@ -12,11 +14,16 @@
+ #include <span>
+ #include <stdexcept>
+ #include <string_view>
++#include <utility>
+ #include <vector>
+ 
++#include <fcntl.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
+ namespace parquet {
+ 
+-using Bytes = std::vector<uint8_t>;
++using Bytes = memory::Vector<uint8_t>;
+ using View = std::string_view;
+ 
+ template<class T> void little_endian(Bytes& bytes, T value) {
+@@ -82,32 +89,59 @@ inline void plain(Bytes& bytes, View text) {
+ inline size_t row_group_limit(size_t longest_string) {
+     constexpr size_t target_page_bytes = 8 << 20;
+     constexpr size_t max_rows = 32768;
+-    // Bound PLAIN string lengths, definition levels and fixed-width columns.
+     size_t per_row = std::max<size_t>(8, longest_string + 5);
+     return std::clamp<size_t>((target_page_bytes - 16) / per_row, 1, max_rows);
+ }
+ 
++struct Page { Bytes values, present; };
++
+ class File {
+     static constexpr int plain_encoding = 0;
+     static constexpr int rle_encoding = 3;
+     struct Chunk { int64_t offset, size; };
+     struct RowGroup { int64_t rows, size; std::vector<Chunk> columns; };
+ 
+-    std::FILE* file_;
++    int fd_;
+     std::span<const Column> schema_;
+     int64_t offset_ = 0;
+     int64_t rows_ = 0;
+-    std::vector<RowGroup> groups_;
+-    Bytes page_;
++    memory::Vector<RowGroup> groups_;
++    std::vector<Bytes> pending_;
++    size_t pending_bytes_ = 0;
+ 
+-    void write(const void* data, size_t size) {
++    void flush() {
++        if (pending_.empty()) return;
+         SHOPPING_TIME(timing::Scope writing(timing::Write);)
+-        if (size && std::fwrite(data, 1, size, file_) != size)
+-            throw std::runtime_error("Parquet write failed");
+-        offset_ += size;
++        std::vector<iovec> segments;
++        segments.reserve(pending_.size());
++        for (auto& part : pending_) segments.push_back({part.data(), part.size()});
++        static const size_t limit = [] {
++            long maximum = sysconf(_SC_IOV_MAX);
++            return size_t(maximum > 0 ? maximum : 16);
++        }();
++        for (size_t at = 0; at < segments.size();) {
++            int count = std::min(limit, segments.size() - at);
++            ssize_t written = writev(fd_, segments.data() + at, count);
++            if (written < 0 && errno == EINTR) continue;
++            if (written <= 0) throw std::runtime_error("Parquet write failed");
++            size_t bytes = written;
++            while (at < segments.size() && bytes >= segments[at].iov_len) bytes -= segments[at++].iov_len;
++            if (bytes) {
++                auto& remainder = segments[at];
++                remainder.iov_base = static_cast<uint8_t*>(remainder.iov_base) + bytes;
++                remainder.iov_len -= bytes;
++            }
++        }
++        pending_.clear();
++        pending_bytes_ = 0;
+     }
+ 
+-    void write(const Bytes& bytes) { write(bytes.data(), bytes.size()); }
++    void queue(Bytes bytes) {
++        if (bytes.empty()) return;
++        offset_ += bytes.size();
++        pending_bytes_ += bytes.size();
++        pending_.push_back(std::move(bytes));
++    }
+ 
+     static void schema_element(Bytes& bytes, const Column& column) {
+         Compact element{bytes};
+@@ -125,7 +159,7 @@ class File {
+             const auto& col = schema_[i];
+             const auto& chunk = group.columns[i];
+             Compact column{bytes};
+-            column.integer(2, 0, Compact::I64); // Deprecated ColumnChunk.file_offset.
++            column.integer(2, 0, Compact::I64);
+             column.field(3, Compact::Struct);
+             Compact meta{bytes};
+             meta.integer(1, col.physical);
+@@ -134,7 +168,7 @@ class File {
+             if (col.nullable) meta.number(rle_encoding);
+             meta.list(3, Compact::Binary, 1);
+             meta.string(col.name);
+-            meta.integer(4, 0); // Uncompressed.
++            meta.integer(4, 0);
+             meta.integer(5, group.rows, Compact::I64);
+             meta.integer(6, chunk.size, Compact::I64);
+             meta.integer(7, chunk.size, Compact::I64);
+@@ -151,34 +185,36 @@ public:
+     File(const std::filesystem::path& path, std::span<const Column> schema)
+         : schema_(schema) {
+         SHOPPING_TIME(timing::Scope writing(timing::Write);)
+-        file_ = std::fopen(path.c_str(), "wb");
+-        if (!file_) throw std::runtime_error("cannot open " + path.string());
+-        if (std::fwrite("PAR1", 1, 4, file_) != 4) {
+-            std::fclose(file_);
+-            throw std::runtime_error("Parquet write failed");
+-        }
+-        offset_ = 4;
++        queue(Bytes{'P', 'A', 'R', '1'});
++        fd_ = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
++        if (fd_ < 0) throw std::runtime_error("cannot open " + path.string());
+     }
+     File(const File&) = delete;
+     File& operator=(const File&) = delete;
+-    ~File() { if (file_) std::fclose(file_); }
++    ~File() { if (fd_ >= 0) close(fd_); }
+ 
+-    template<class Encode> void append(int32_t count, Encode encode) {
++    void append(int32_t count, std::span<Page> columns) {
+         if (!count) return;
+         RowGroup group{count, 0, {}};
+         group.columns.reserve(schema_.size());
+-        Bytes header;
+-        header.reserve(32);
+         for (size_t i = 0; i < schema_.size(); ++i) {
+-            page_.clear();
+-            encode(i, page_);
+-            if (page_.size() > uint32_t(std::numeric_limits<int32_t>::max()))
++            auto& column = columns[i];
++            Bytes levels;
++            if (schema_[i].nullable) {
++                uint64_t run = (uint64_t(column.present.size()) << 1) | 1;
++                uint32_t length = column.present.size() + (std::bit_width(run) + 6) / 7;
++                little_endian(levels, length);
++                varint(levels, run);
++            }
++            size_t page_size = column.values.size() + levels.size() + column.present.size();
++            if (page_size > uint32_t(std::numeric_limits<int32_t>::max()))
+                 throw std::runtime_error("Parquet page exceeds size limit");
+-            header.clear();
++            Bytes header;
++            header.reserve(32);
+             Compact page{header};
+-            page.integer(1, 0); // Data Page V1.
+-            page.integer(2, page_.size());
+-            page.integer(3, page_.size());
++            page.integer(1, 0);
++            page.integer(2, page_size);
++            page.integer(3, page_size);
+             page.field(5, Compact::Struct);
+             Compact data{header};
+             data.integer(1, count);
+@@ -188,13 +224,16 @@ public:
+             data.end();
+             page.end();
+             int64_t start = offset_;
+-            write(header);
+-            write(page_);
++            queue(std::move(header));
++            queue(std::move(levels));
++            queue(std::exchange(column.present, {}));
++            queue(std::exchange(column.values, {}));
+             group.columns.push_back({start, offset_ - start});
+             group.size += offset_ - start;
+         }
+         groups_.push_back(std::move(group));
+         rows_ += count;
++        if (pending_bytes_ >= (128 << 20)) flush();
+     }
+ 
+     void finish() {
+@@ -213,28 +252,14 @@ public:
+         metadata.end();
+         auto size = static_cast<uint32_t>(footer.size());
+         little_endian(footer, size);
+-        write(footer);
+-        write("PAR1", 4);
+-        SHOPPING_TIME(timing::Scope close(timing::Write);)
+-        int error = std::fclose(file_);
+-        file_ = nullptr;
++        footer.insert(footer.end(), {'P', 'A', 'R', '1'});
++        queue(std::move(footer));
++        flush();
++        SHOPPING_TIME(timing::Scope closing(timing::Write);)
++        int error = close(fd_);
++        fd_ = -1;
+         if (error) throw std::runtime_error("Parquet close failed");
+     }
+ };
+ 
+-// Optional flat column: one bit per row, with a hybrid RLE/bit-packed prefix.
+-template<class Present> void definitions(Bytes& bytes, size_t count, Present present) {
+-    uint32_t groups = (count + 7) / 8;
+-    bytes.resize(4);
+-    varint(bytes, (uint64_t(groups) << 1) | 1);
+-    for (size_t base = 0; base < count; base += 8) {
+-        uint8_t bits = 0;
+-        for (size_t i = 0; i < std::min<size_t>(8, count - base); ++i)
+-            bits |= uint8_t(present(base + i)) << i;
+-        bytes.push_back(bits);
+-    }
+-    uint32_t size = bytes.size() - 4;
+-    std::memcpy(bytes.data(), &size, 4);
+ }
+-
+-} // namespace parquet
+diff --git a/scatter.hpp b/scatter.hpp
+index 7c90c94..3989b32 100644
+--- a/scatter.hpp
++++ b/scatter.hpp
+@@ -31,7 +31,21 @@ public:
+     explicit ScatterArena(bool huge) : huge_(huge) {}
+     ScatterArena(const ScatterArena&) = delete;
+     ScatterArena& operator=(const ScatterArena&) = delete;
+-    ~ScatterArena() { for (void* base : slabs_) munmap(base, slab_bytes); }
++    ~ScatterArena() {
++        for (void* base : slabs_) {
++            memory::forget(base);
++            munmap(base, slab_bytes);
++        }
++    }
++
++    void take_mappings(std::vector<memory::Region>& regions) {
++        regions.reserve(regions.size() + slabs_.size());
++        for (void* base : slabs_) {
++            regions.push_back({base, slab_bytes});
++            memory::forget(base);
++        }
++        slabs_.clear();
++    }
+ 
+     void* block(size_t bytes) {
+         if (remaining_ < bytes) {
+@@ -56,6 +70,13 @@ public:
+                 base = aligned;
+             }
+ #endif
++            try {
++                memory::remember({base, slab_bytes});
++            } catch (...) {
++                munmap(base, slab_bytes);
++                slabs_.pop_back();
++                throw;
++            }
+             slabs_.back() = base;
+             next_ = static_cast<std::byte*>(base);
+             remaining_ = slab_bytes;
+@@ -162,6 +183,7 @@ public:
+     }
+ 
+     size_t size(size_t index) const { return streams_[index].count; }
++    void take_mappings(std::vector<memory::Region>& regions) { arena_.take_mappings(regions); }
+     const T* first(size_t index) const {
+         auto* block = streams_[index].head;
+         return block ? block->lines[0].rows : nullptr;
+diff --git a/session_buckets.hpp b/session_buckets.hpp
+new file mode 100644
+index 0000000..3b507c3
+--- /dev/null
++++ b/session_buckets.hpp
+@@ -0,0 +1,114 @@
++#pragma once
++
++struct BucketLayout {
++    uint32_t count;
++    unsigned bits;
++
++    static BucketLayout for_span(uint64_t span) {
++        if (!span || span > (uint64_t{1} << 32)) return {};
++        uint32_t count = (span - 1) / gap_ms + 1;
++        return {count, unsigned(std::bit_width(count - 1))};
++    }
++
++    size_t person_limit() const { return size_t{1} << (32 - bits); }
++    uint64_t key(uint32_t person, uint32_t bucket, uint32_t time) const {
++        return (uint64_t(person) << (32 + bits)) | (uint64_t(bucket) << 32) | time;
++    }
++    uint32_t person(uint64_t key) const { return key >> (32 + bits); }
++    uint32_t bucket(uint64_t key) const { return uint32_t(key >> 32) & ((uint32_t{1} << bits) - 1); }
++};
++
++template<class Category> struct SessionPurchase {
++    uint64_t key;
++    uint32_t price;
++    Category category;
++};
++
++template<class Cursor> class SortedSessions {
++    Cursor events_;
++    const Window& window_;
++
++public:
++    SortedSessions(Cursor events, const Window& window) : events_(std::move(events)), window_(window) {}
++
++    bool empty() const { return events_.empty(); }
++    int64_t start() const { return unpack(events_.front(), window_).time; }
++
++    template<class Buy> size_t take(Buy buy) {
++        size_t count = 0;
++        int64_t previous;
++        do {
++            auto row = unpack(events_.front(), window_);
++            events_.pop();
++            previous = row.time;
++            ++count;
++            if (row.price) buy(row.price, row.category);
++        } while (!events_.empty() && uint64_t(start()) - uint64_t(previous) <= gap_ms);
++        return count;
++    }
++};
++
++template<class Category> class BucketSessions {
++    struct Run { uint32_t low, high; size_t size; };
++    std::span<const uint64_t> keys_;
++    std::span<const SessionPurchase<Category>>& purchases_;
++    int64_t window_start_;
++    uint64_t person_;
++    Run pending_{};
++
++    Run run() {
++        const uint64_t group = keys_[0] >> 32;
++        uint32_t low = keys_[0], high = low;
++        size_t count = 1;
++        while (count < keys_.size() && keys_[count] >> 32 == group) {
++            uint32_t time = keys_[count++];
++            low = std::min(low, time);
++            high = std::max(high, time);
++        }
++        keys_ = keys_.subspan(count);
++        return {low, high, count};
++    }
++
++public:
++    BucketSessions(std::span<const uint64_t> keys, std::span<const SessionPurchase<Category>>& purchases,
++                   uint32_t person, int64_t window_start)
++        : keys_(keys), purchases_(purchases), window_start_(window_start), person_(uint64_t(person) << 32) {
++        if (!keys_.empty()) pending_ = run();
++    }
++
++    bool empty() const { return pending_.size == 0; }
++    int64_t start() const { return window_start_ + pending_.low; }
++
++    template<class Buy> size_t take(Buy buy) {
++        uint32_t last = pending_.high;
++        size_t count = pending_.size;
++        pending_ = {};
++        while (!keys_.empty()) {
++            auto next = run();
++            if (next.low - last > gap_ms) {
++                pending_ = next;
++                break;
++            }
++            last = next.high;
++            count += next.size;
++        }
++        while (!purchases_.empty() && purchases_[0].key <= (person_ | last)) {
++            buy(purchases_[0].price, purchases_[0].category);
++            purchases_ = purchases_.subspan(1);
++        }
++        return count;
++    }
++};
++
++template<class Index>
++void bucket_scatter(const BucketLayout& layout, uint64_t* keys, uint64_t* scratch, size_t count,
++                    std::vector<Index>& buckets, std::vector<Index>& people) {
++    Index next = 0;
++    for (auto& bucket : buckets) {
++        auto size = bucket;
++        bucket = next;
++        next += size;
++    }
++    for (size_t i = 0; i < count; ++i) scratch[buckets[layout.bucket(keys[i])]++] = keys[i];
++    for (size_t i = 0; i < count; ++i) keys[people[layout.person(scratch[i])]++] = scratch[i];
++}
