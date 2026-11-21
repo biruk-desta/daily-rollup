@@ -26,11 +26,13 @@ profile() (
 
     case "${SHOPPING_PGO:-gcc}" in
         gcc)
-            "$compiler" "$@" -DSHOPPING_PROFILE_GENERATE -fprofile-generate="$scratch/profile" \
-                -fprofile-update=atomic "$source_dir/main.cpp" -o shopping || exit 1
+            # The dump call in main.cpp is a weak reference: force the archive member in.
+            "$compiler" "$@" -fprofile-generate="$scratch/profile" \
+                -fprofile-update=atomic -Wl,--undefined=__gcov_dump "$source_dir/main.cpp" -o shopping || exit 1
             ;;
         clang)
-            "$compiler" "$@" -DSHOPPING_PROFILE_GENERATE -fprofile-instr-generate \
+            case "$(uname -s)" in Darwin) writer=___llvm_profile_write_file ;; *) writer=__llvm_profile_write_file ;; esac
+            "$compiler" "$@" -fprofile-instr-generate -Wl,-u,"$writer" \
                 "$source_dir/main.cpp" -o shopping || exit 1
             ;;
         *) exit 1 ;;

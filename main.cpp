@@ -25,6 +25,9 @@
 #include <arm_neon.h>
 #endif
 
+extern "C" void __gcov_dump(void) __attribute__((weak));
+extern "C" int __llvm_profile_write_file(void) __attribute__((weak));
+
 namespace fs = std::filesystem;
 using View = std::string_view;
 constexpr int64_t day_ms = 86'400'000;
@@ -1463,12 +1466,11 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
         write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
     });
     trace.mark("finish");
-#if defined(SHOPPING_PROFILE_GENERATE)
-    // The compiler's profile writer is registered with atexit.
-    std::exit(0);
-#else
+    // Same code in the profiling and the final build: the profile writers are
+    // weak symbols that exist only when the binary is instrumented.
+    if (__gcov_dump) __gcov_dump();
+    if (__llvm_profile_write_file) __llvm_profile_write_file();
     _exit(0);
-#endif
 }
 
 int main(int argc, char** argv) try {
