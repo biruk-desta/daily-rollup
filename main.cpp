@@ -214,6 +214,7 @@ public:
         constexpr const char* names[] = {"scalar", "NEON", "AVX2", "AVX-512BW"};
         std::fprintf(stderr, "CSV %s\n", names[static_cast<unsigned>(scanner)]);
         std::fprintf(stderr, "trace columns: phase, monotonic_ns, wall_s, cpu_s, minor_faults, major_faults\n");
+        SHOPPING_TIME(timing::calibrate();)
         mark("start");
     }
 

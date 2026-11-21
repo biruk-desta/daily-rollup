@@ -19,7 +19,8 @@
 #endif
 
 namespace timing {
-enum Part { Scan, Parse, Validate, Hash, PersonHash, Route, Group, Sessions, Attribution, Encode, Write, Count };
+enum Part { Scan, Parse, Validate, Hash, PersonHash, Route, Group, Sessions, Attribution, Encode, Write,
+            MarkerScan, Calibration, Count };
 
 inline bool enabled() {
     static const bool on = std::getenv("SHOPPING_DETAIL") != nullptr;
@@ -27,9 +28,9 @@ inline bool enabled() {
 }
 
 struct Time {
-    long long cpu = 0, wall = 0;
-    Time& operator+=(Time b) { cpu += b.cpu; wall += b.wall; return *this; }
-    friend Time operator-(Time a, Time b) { return {a.cpu - b.cpu, a.wall - b.wall}; }
+    long long cpu = 0, wall = 0, samples = 0;
+    Time& operator+=(Time b) { cpu += b.cpu; wall += b.wall; samples += b.samples; return *this; }
+    friend Time operator-(Time a, Time b) { return {a.cpu - b.cpu, a.wall - b.wall, a.samples - b.samples}; }
 };
 
 inline long long nanos(clockid_t clock) {
@@ -117,8 +118,8 @@ public:
         auto end = weight_ > 1 ? Time{0, fine_wall()} : stamp();
         auto cost = weight_ > 1 ? Time{0, fine_overhead()} : overhead();
         auto elapsed = end - start_ - cost - nested_cost_;
-        if (weight_ > 1) elapsed.wall = std::clamp(elapsed.wall, 0LL, 5'000LL);
-        local_->times[part_] += {elapsed.cpu * weight_, elapsed.wall * weight_};
+        if (weight_ > 1) elapsed.wall = std::min(elapsed.wall, 5'000LL);
+        local_->times[part_] += {elapsed.cpu * weight_, elapsed.wall * weight_, weight_};
         current_ = parent_;
         if (parent_) {
             parent_->nested_cost_ += nested_cost_;
@@ -127,16 +128,26 @@ public:
     }
 };
 
+inline void calibrate() {
+    if (!enabled()) return;
+    Local local;
+    for (unsigned i = 0; i < 1024; ++i) {
+        Scope empty(Calibration, 2);
+        asm volatile("" ::: "memory");
+    }
+}
+
 inline void report() {
     if (!enabled()) return;
     constexpr const char* names[] = {"scan", "parse", "validate", "hash", "person hash", "route",
                                      "group", "sessions", "attribution", "encode", "write"};
-    auto split = [](Part parent, std::initializer_list<Part> parts) {
+    auto split = [](Part parent, long long reserve, std::initializer_list<Part> parts) {
         long long total = 0;
         for (auto part : parts) total += global[part].wall;
         auto& all = global[parent];
-        if (total > all.wall) {
-            for (auto part : parts) global[part].wall = global[part].wall * all.wall / total;
+        long long available = std::max(0LL, all.wall - reserve);
+        if (total > available) {
+            for (auto part : parts) global[part].wall = global[part].wall * available / total;
         }
         Time used{};
         for (auto part : parts) {
@@ -146,12 +157,19 @@ inline void report() {
         }
         all = all - used;
     };
+    auto empty = global[Calibration];
+    if (empty.samples) {
+        for (auto part : {Parse, Validate, Hash, PersonHash, Route, Attribution}) {
+            auto& time = global[part];
+            time.wall = std::max(0LL, time.wall - (empty.wall * time.samples / empty.samples));
+        }
+    }
     global[Validate].wall = std::max(0LL, global[Validate].wall - global[PersonHash].wall);
     global[Hash] += global[PersonHash];
-    split(Scan, {Parse, Validate, Hash, Route});
-    split(Sessions, {Attribution});
+    split(Scan, global[MarkerScan].wall, {Parse, Validate, Hash, Route});
+    split(Sessions, 0, {Attribution});
     global[Encode] = global[Encode] - global[Write];
-    for (size_t i = 0; i < Count; ++i) {
+    for (size_t i = 0; i < std::size(names); ++i) {
         if (i == PersonHash) continue;
         std::fprintf(stderr, "detail %s %.3f %.3f\n", names[i],
                      global[i].cpu / 1e6, global[i].wall / 1e6);

@@ -135,7 +135,10 @@ template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row) 
             scan_scalar<N>(chunk.substr(0, size), row);
         } else {
             CsvIndex index;
-            csv_blocks<Mark>(index, chunk.substr(0, size));
+            {
+                SHOPPING_TIME(timing::Scope markers(timing::MarkerScan);)
+                csv_blocks<Mark>(index, chunk.substr(0, size));
+            }
             index.parse<N>(chunk.data(), row);
         }
         chunk.remove_prefix(size);
