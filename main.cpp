@@ -204,7 +204,7 @@ class Trace {
     bool enabled_ = std::getenv("SHOPPING_TRACE") != nullptr;
     int64_t time_ = 0;
     rusage usage_{};
-    SHOPPING_TIME(timing::Hardware hardware_;)
+    SHOPPING_COUNT(timing::Hardware hardware_;)
 
     static int64_t micros(timeval t) { return int64_t(t.tv_sec) * 1'000'000 + t.tv_usec; }
 
@@ -231,7 +231,7 @@ public:
             double(cpu) / 1e6, usage.ru_minflt - usage_.ru_minflt, usage.ru_majflt - usage_.ru_majflt);
         time_ = time;
         usage_ = usage;
-        SHOPPING_TIME(hardware_.mark(phase);)
+        SHOPPING_COUNT(hardware_.mark(phase);)
     }
 
 };
@@ -736,6 +736,7 @@ using Person = uint64_t;
 
 class Ids {
     static constexpr uint64_t external = uint64_t{1} << 63;
+    static constexpr uint64_t prefixed = uint64_t{1} << 55;
     static constexpr uint64_t multiplier = 0x94d049bb133111ebULL;
     static constexpr uint64_t inverse = 0x319642b2d24d8ec3ULL;
     static_assert(multiplier * inverse == 1);
@@ -747,10 +748,18 @@ class Ids {
         size_t longest = 0;
     };
     std::array<Shard, 64> shards_;
+    char prefix_;
 
     // Nonzero ASCII bytes take seven bits each. The zero padding distinguishes
     // different lengths. Other byte strings use the high-bit tag and a shard index.
-    static uint64_t inline_id(View bytes) {
+    uint64_t inline_id(View bytes) const {
+        if (bytes.size() == 9 && bytes[0] == prefix_) {
+            uint64_t suffix;
+            std::memcpy(&suffix, bytes.data() + 1, sizeof(suffix));
+            constexpr uint64_t high_bits = 0x8080808080808080ULL;
+            if (!((suffix | (suffix - 0x0101010101010101ULL)) & high_bits))
+                return suffix | external | prefixed;
+        }
         if (bytes.size() == 8 || bytes.size() == 9) {
             uint64_t word;
             std::memcpy(&word, bytes.data(), 8);
@@ -774,6 +783,8 @@ class Ids {
     }
 
 public:
+    explicit Ids(char prefix) : prefix_(prefix) {}
+
     Person key(View bytes) {
         uint64_t value = inline_id(bytes);
         if (!value) {
@@ -803,7 +814,13 @@ public:
     // Called after the input stages have stopped interning IDs.
     View name(Person key, char (&buffer)[9]) const {
         uint64_t value = (key ^ (key >> 32)) * inverse;
-        if (value & external) return shards_[(value >> 32) & 63].names[uint32_t(value)];
+        if (value & external) {
+            if (!(value & prefixed)) return shards_[(value >> 32) & 63].names[uint32_t(value)];
+            uint64_t suffix = value ^ (external | prefixed);
+            buffer[0] = prefix_;
+            std::memcpy(buffer + 1, &suffix, sizeof(suffix));
+            return View(buffer, sizeof(buffer));
+        }
         uint64_t word = (value & 0x0fffffffULL) | ((value & 0x00fffffff0000000ULL) << 4);
         word = (word & 0x00003fff00003fffULL) | ((word & 0x0fffc0000fffc000ULL) << 2);
         word = (word & 0x007f007f007f007fULL) | ((word & 0x3f803f803f803f80ULL) << 1);
@@ -1065,7 +1082,7 @@ read_events(const Input& input, unsigned threads, Trace& trace,
                                            const Window& window, const Catalogs& catalogs,
                                            const Input& links, Ids& ids,
                                            std::optional<People>& people) {
-    Ids event_ids;
+    Ids event_ids('e');
     size_t estimated_rows = 0;
     for (View chunk : input.chunks) estimated_rows += chunk.size() / 64;
     size_t capacity_per_bucket = estimated_rows / (threads * event_buckets);
@@ -1079,7 +1096,7 @@ read_events(const Input& input, unsigned threads, Trace& trace,
         }
         SHOPPING_TIME(timing::Scope scanning(timing::Scan);)
         scan<7>(input.chunks[task - 1], [&](View, const Fields<7>& fields) {
-            SHOPPING_TIME(unsigned weight = timing::sample(256); timing::Scope row(timing::Rows, weight);)
+            SHOPPING_TIME(unsigned weight = timing::sample(256);)
             if (fields[0].empty()) return;
             uint64_t id;
             {
@@ -1496,7 +1513,7 @@ template<class Candidate>
 void process(const Window& window, const Input& links, const Catalogs& catalogs,
              const Input& event_input, const Input& click_input, const fs::path& out,
              unsigned threads, Trace& trace) {
-    Ids ids;
+    Ids ids('u');
     std::optional<People> people;
     auto events = read_events<Candidate>(event_input, threads, trace, window, catalogs, links, ids, people);
     auto clicks = read_clicks(click_input, threads, trace, [&](const Fields<4>& f, auto& partitions) {

@@ -1,6 +1,6 @@
 #pragma once
 
-#ifdef SHOPPING_DETAIL_TRACE
+#if defined(SHOPPING_DETAIL_TRACE) || defined(SHOPPING_PHASE_COUNTERS)
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -19,7 +19,7 @@
 #endif
 
 namespace timing {
-enum Part { Scan, Rows, Parse, Validate, Hash, PersonHash, Route, Group, Sessions, Attribution, Encode, Write, Count };
+enum Part { Scan, Parse, Validate, Hash, PersonHash, Route, Group, Sessions, Attribution, Encode, Write, Count };
 
 inline bool enabled() {
     static const bool on = std::getenv("SHOPPING_DETAIL") != nullptr;
@@ -129,7 +129,7 @@ public:
 
 inline void report() {
     if (!enabled()) return;
-    constexpr const char* names[] = {"scan", "rows", "parse", "validate", "hash", "person hash", "route",
+    constexpr const char* names[] = {"scan", "parse", "validate", "hash", "person hash", "route",
                                      "group", "sessions", "attribution", "encode", "write"};
     auto split = [](Part parent, std::initializer_list<Part> parts) {
         long long total = 0;
@@ -152,7 +152,7 @@ inline void report() {
     split(Sessions, {Attribution});
     global[Encode] = global[Encode] - global[Write];
     for (size_t i = 0; i < Count; ++i) {
-        if (i == Rows || i == PersonHash) continue;
+        if (i == PersonHash) continue;
         std::fprintf(stderr, "detail %s %.3f %.3f\n", names[i],
                      global[i].cpu / 1e6, global[i].wall / 1e6);
     }
@@ -161,7 +161,7 @@ inline void report() {
 class Hardware {
 #ifdef __linux__
     std::array<int, 4> files_{-1, -1, -1, -1};
-    std::array<unsigned long long, 4> previous_{};
+    std::array<std::array<unsigned long long, 3>, 4> previous_{};
 
     void close_all() {
         for (int& fd : files_) if (fd >= 0) { close(fd); fd = -1; }
@@ -194,11 +194,14 @@ public:
         if (files_[0] < 0) return;
         std::array<unsigned long long, 4> delta{};
         for (size_t i = 0; i < files_.size(); ++i) {
-            unsigned long long value[3]{};
-            if (read(files_[i], value, sizeof(value)) != sizeof(value)) { close_all(); return; }
-            delta[i] = value[0] - previous_[i];
-            previous_[i] = value[0];
-            if (!value[2] || value[2] < value[1] - value[1] / 100) { close_all(); return; }
+            std::array<unsigned long long, 3> value{};
+            if (read(files_[i], value.data(), sizeof(value)) != sizeof(value)) { close_all(); return; }
+            const auto& previous = previous_[i];
+            auto enabled = value[1] - previous[1], running = value[2] - previous[2];
+            auto count = value[0] - previous[0];
+            if (enabled && (!running || running < enabled / 2)) { close_all(); return; }
+            delta[i] = running && running < enabled ? double(count) * enabled / running : count;
+            previous_[i] = value;
         }
         std::fprintf(stderr, "perf %s %llu %llu %llu %llu\n", phase,
                      delta[0], delta[1], delta[2], delta[3]);
@@ -206,8 +209,16 @@ public:
     }
 };
 } // namespace timing
+#endif
 
+#ifdef SHOPPING_DETAIL_TRACE
 #define SHOPPING_TIME(...) __VA_ARGS__
 #else
 #define SHOPPING_TIME(...)
+#endif
+
+#ifdef SHOPPING_PHASE_COUNTERS
+#define SHOPPING_COUNT(...) __VA_ARGS__
+#else
+#define SHOPPING_COUNT(...)
 #endif
