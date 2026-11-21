@@ -1,0 +1,967 @@
+#include "parquet.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <charconv>
+#include <chrono>
+#include <cstdlib>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__x86_64__)
+#include <cpuid.h>
+#include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+namespace fs = std::filesystem;
+using View = std::string_view;
+constexpr int64_t day_ms = 86'400'000;
+constexpr int64_t week_ms = 7 * day_ms;
+constexpr int64_t gap_ms = 1'800'000;
+constexpr int64_t bad_time = INT64_MIN;
+constexpr unsigned partition_count = 128;
+constexpr uint32_t no_category = UINT32_MAX;
+
+struct Hash {
+    size_t operator()(View s) const noexcept {
+        uint64_t hash = uint64_t(s.size()) * 0x9e3779b97f4a7c15ULL;
+        while (s.size() >= 8) {
+            uint64_t word;
+            std::memcpy(&word, s.data(), 8);
+            hash = (hash ^ word) * 0xbf58476d1ce4e5b9ULL;
+            s.remove_prefix(8);
+        }
+        uint64_t tail = 0;
+        if (!s.empty()) std::memcpy(&tail, s.data(), s.size());
+        hash = (hash ^ tail) * 0x94d049bb133111ebULL;
+        return hash ^ (hash >> 32);
+    }
+};
+
+template<class V> using StringMap = std::unordered_map<View, V, Hash>;
+template<class T> using Partitions = std::array<std::vector<T>, partition_count>;
+
+class Mapping {
+    View data_;
+public:
+    explicit Mapping(const fs::path& path) {
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd == -1) throw std::runtime_error("cannot open " + path.string());
+        struct stat info{};
+        if (fstat(fd, &info) != 0) {
+            close(fd);
+            throw std::runtime_error("cannot stat " + path.string());
+        }
+        if (info.st_size) {
+            auto size = static_cast<size_t>(info.st_size);
+            void* address = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (address == MAP_FAILED) throw std::runtime_error("cannot map " + path.string());
+            data_ = View(static_cast<const char*>(address), size);
+        } else {
+            close(fd);
+        }
+    }
+    Mapping(const Mapping&) = delete;
+    Mapping& operator=(const Mapping&) = delete;
+    ~Mapping() { if (!data_.empty()) munmap(const_cast<char*>(data_.data()), data_.size()); }
+    View bytes() const { return data_; }
+};
+
+struct Input {
+    std::vector<std::unique_ptr<Mapping>> maps;
+    std::vector<View> chunks;
+
+    Input(const fs::path& path, bool directory) {
+        if (directory) {
+            std::vector<fs::path> paths;
+            for (const auto& entry : fs::directory_iterator(path))
+                if (entry.path().extension() == ".csv" && entry.is_regular_file())
+                    paths.push_back(entry.path());
+            std::sort(paths.begin(), paths.end());
+            for (const auto& file : paths) add(file);
+        } else {
+            add(path);
+        }
+    }
+
+    void add(const fs::path& path) {
+        maps.push_back(std::make_unique<Mapping>(path));
+        View input = maps.back()->bytes();
+        size_t header = input.find('\n');
+        if (header == View::npos) return;
+        input.remove_prefix(header + 1);
+        constexpr size_t chunk_size = 2 << 20;
+        while (!input.empty()) {
+            size_t end = input.size();
+            if (end > chunk_size) {
+                size_t newline = input.find('\n', chunk_size);
+                if (newline != View::npos) end = newline + 1;
+            }
+            chunks.push_back(input.substr(0, end));
+            input.remove_prefix(end);
+        }
+    }
+};
+
+template<class Work> void parallel(unsigned threads, size_t tasks, Work work) {
+    if (!tasks) return;
+    unsigned workers = std::min<size_t>(threads, tasks);
+    std::atomic<size_t> next{0};
+    std::mutex error_mutex;
+    std::exception_ptr error;
+    auto run = [&](unsigned worker) {
+        try {
+            for (size_t task; (task = next.fetch_add(1, std::memory_order_relaxed)) < tasks;)
+                work(worker, task);
+        } catch (...) {
+            next.store(tasks, std::memory_order_relaxed);
+            std::lock_guard lock(error_mutex);
+            if (!error) error = std::current_exception();
+        }
+    };
+    {
+        std::vector<std::jthread> pool;
+        pool.reserve(workers - 1);
+        for (unsigned i = 1; i < workers; ++i) pool.emplace_back(run, i);
+        run(0);
+    }
+    if (error) std::rethrow_exception(error);
+}
+
+template<size_t N> using Fields = std::array<View, N>;
+
+template<size_t N> bool split(View line, Fields<N>& fields) {
+    for (size_t i = 0; i < N; ++i) {
+        size_t comma = line.find(',');
+        if ((comma == View::npos) != (i == N - 1)) return false;
+        View value = line.substr(0, comma);
+        if (value.starts_with('"')) {
+            if (value.size() < 2 || !value.ends_with('"')) return false;
+            value.remove_prefix(1);
+            value.remove_suffix(1);
+        }
+        if (value.find('"') != View::npos) return false;
+        fields[i] = value;
+        if (comma != View::npos) line.remove_prefix(comma + 1);
+    }
+    return true;
+}
+
+template<size_t N, class Row> void scan_scalar(View chunk, Row row) {
+    while (!chunk.empty()) {
+        size_t newline = chunk.find('\n');
+        View line = chunk.substr(0, newline);
+        Fields<N> fields;
+        if (split(line, fields)) row(line, fields);
+        if (newline == View::npos) break;
+        chunk.remove_prefix(newline + 1);
+    }
+}
+
+enum class Scanner { Scalar, Neon, Avx2, Avx512 };
+
+Scanner select_scanner() {
+    if (std::getenv("SHOPPING_SCALAR")) return Scanner::Scalar;
+#if defined(__x86_64__)
+    unsigned a, b, c, d;
+    constexpr unsigned vector_support = bit_AVX | bit_OSXSAVE | bit_POPCNT;
+    if (!__get_cpuid(1, &a, &b, &c, &d) || (c & vector_support) != vector_support ||
+        !__get_cpuid_count(7, 0, &a, &b, &c, &d)) return Scanner::Scalar;
+    unsigned xcr0, upper;
+    __asm__ volatile("xgetbv" : "=a"(xcr0), "=d"(upper) : "c"(0));
+    // XCR0 must enable SSE/YMM and, for AVX-512, the opmask and ZMM state.
+    constexpr unsigned avx512 = bit_AVX512F | bit_AVX512BW;
+    if ((xcr0 & 0xe6) == 0xe6 && (b & avx512) == avx512) return Scanner::Avx512;
+    if ((xcr0 & 0x06) == 0x06 && (b & bit_AVX2)) return Scanner::Avx2;
+#elif defined(__aarch64__)
+    return Scanner::Neon;
+#endif
+    return Scanner::Scalar;
+}
+
+const Scanner scanner = select_scanner();
+
+// A block supplies the positions of commas, LF and quotes. Shift is zero for
+// x86's one bit per byte and two for NEON's four bits per byte.
+template<size_t N, unsigned Shift, class Row> class Delimited {
+    Row& row_;
+    const char* line_;
+    const char* field_;
+    Fields<N> fields_;
+    size_t column_ = 0;
+    unsigned quotes_ = 0;
+    bool malformed_ = false;
+
+    void field(const char* end) {
+        if (column_ == N) {
+            malformed_ = true;
+            return;
+        }
+        const char* start = field_;
+        if (quotes_) {
+            if (quotes_ != 2 || end - start < 2 || *start != '"' || end[-1] != '"') {
+                malformed_ = true;
+            } else {
+                ++start;
+                --end;
+            }
+        }
+        fields_[column_++] = View(start, end - start);
+    }
+
+public:
+    Delimited(const char* start, Row& row) : row_(row), line_(start), field_(start) {}
+
+    void block(const char* data, uint64_t ends, uint64_t quotes) {
+        while (ends) {
+            unsigned bit = std::countr_zero(ends);
+            const char* separator = data + (bit >> Shift);
+            uint64_t before = quotes & ((uint64_t{1} << bit) - 1);
+            if (before) quotes_ = std::min(3u, quotes_ + unsigned(std::popcount(before)));
+            quotes ^= before;
+            field(separator);
+            field_ = separator + 1;
+            quotes_ = 0;
+            if (*separator == '\n') {
+                if (!malformed_ && column_ == N) row_(View(line_, separator - line_), fields_);
+                line_ = field_;
+                column_ = 0;
+                malformed_ = false;
+            }
+            ends &= ends - 1;
+        }
+        if (quotes) quotes_ = std::min(3u, quotes_ + unsigned(std::popcount(quotes)));
+    }
+
+    void finish(const char* end) {
+        if (line_ < end) scan_scalar<N>(View(line_, end - line_), row_);
+    }
+};
+
+#if defined(__x86_64__)
+template<size_t N, class Row> __attribute__((target("avx2,popcnt")))
+void scan_avx2(View chunk, Row row) {
+    const char* p = chunk.data();
+    const char* end = p + chunk.size();
+    Delimited<N, 0, Row> parser(p, row);
+    for (; end - p >= 32; p += 32) {
+        auto data = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        auto comma = _mm256_cmpeq_epi8(data, _mm256_set1_epi8(','));
+        auto newline = _mm256_cmpeq_epi8(data, _mm256_set1_epi8('\n'));
+        auto quotes = _mm256_cmpeq_epi8(data, _mm256_set1_epi8('"'));
+        parser.block(p, uint32_t(_mm256_movemask_epi8(_mm256_or_si256(comma, newline))),
+                        uint32_t(_mm256_movemask_epi8(quotes)));
+    }
+    parser.finish(end);
+}
+
+template<size_t N, class Row> __attribute__((target("avx512bw,popcnt")))
+void scan_avx512(View chunk, Row row) {
+    const char* p = chunk.data();
+    const char* end = p + chunk.size();
+    Delimited<N, 0, Row> parser(p, row);
+    for (; end - p >= 64; p += 64) {
+        auto data = _mm512_loadu_si512(p);
+        uint64_t comma = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8(','));
+        uint64_t newline = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('\n'));
+        uint64_t quotes = _mm512_cmpeq_epi8_mask(data, _mm512_set1_epi8('"'));
+        parser.block(p, comma | newline, quotes);
+    }
+    parser.finish(end);
+}
+#elif defined(__aarch64__)
+uint64_t neon_mask(uint8x16_t compared) {
+    auto nibbles = vshrn_n_u16(vreinterpretq_u16_u8(compared), 4);
+    return vget_lane_u64(vreinterpret_u64_u8(nibbles), 0) & 0x1111111111111111ULL;
+}
+
+template<size_t N, class Row> void scan_neon(View chunk, Row row) {
+    const char* p = chunk.data();
+    const char* end = p + chunk.size();
+    Delimited<N, 2, Row> parser(p, row);
+    for (; end - p >= 16; p += 16) {
+        auto data = vld1q_u8(reinterpret_cast<const uint8_t*>(p));
+        auto comma = vceqq_u8(data, vdupq_n_u8(','));
+        auto newline = vceqq_u8(data, vdupq_n_u8('\n'));
+        auto quotes = vceqq_u8(data, vdupq_n_u8('"'));
+        parser.block(p, neon_mask(vorrq_u8(comma, newline)), neon_mask(quotes));
+    }
+    parser.finish(end);
+}
+#endif
+
+template<size_t N, class Row> void scan(View chunk, Row row) {
+#if defined(__x86_64__)
+    if (scanner == Scanner::Avx512) return scan_avx512<N>(chunk, row);
+    if (scanner == Scanner::Avx2) return scan_avx2<N>(chunk, row);
+#elif defined(__aarch64__)
+    if (scanner == Scanner::Neon) return scan_neon<N>(chunk, row);
+#endif
+    scan_scalar<N>(chunk, row);
+}
+
+int two_digits(const char* text) {
+    unsigned word = uint8_t(text[0]) | unsigned(uint8_t(text[1])) << 8;
+    if ((word & 0xf0f0) != 0x3030 || ((word + 0x0606) & 0xf0f0) != 0x3030) return -1;
+    return int((word & 15) * 10 + ((word >> 8) & 15));
+}
+
+int64_t decimal(View field, int64_t limit) {
+    if (field.empty()) return bad_time;
+    int64_t value = 0;
+    if (field.size() <= 18) {
+        for (char c : field) {
+            unsigned digit = unsigned(c - '0');
+            if (digit > 9) return bad_time;
+            value = value * 10 + digit;
+        }
+        return value <= limit ? value : bad_time;
+    }
+    for (char c : field) {
+        unsigned digit = unsigned(c - '0');
+        if (digit > 9 || value > limit / 10 ||
+            (value == limit / 10 && digit > uint64_t(limit % 10))) return bad_time;
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+struct Year { int32_t days; bool leap; };
+constexpr auto years = [] {
+    std::array<Year, 10000> table{};
+    for (int y = 1; y <= 9999; ++y) {
+        int prior = y - 1;
+        table[y] = {prior * 365 + prior / 4 - prior / 100 + prior / 400 - 719162,
+                    y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)};
+    }
+    return table;
+}();
+constexpr int month_lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+constexpr int month_offsets[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+
+int64_t timestamp(View s) {
+    if ((s.size() != 20 && s.size() != 25) || s[4] != '-')
+        return decimal(s, INT64_MAX);
+    if (s[7] != '-' || s[10] != 'T' || s[13] != ':' || s[16] != ':') return bad_time;
+    const char* p = s.data();
+    int century = two_digits(p), yr = two_digits(p + 2);
+    int m = two_digits(p + 5), d = two_digits(p + 8);
+    int h = two_digits(p + 11), minute = two_digits(p + 14), second = two_digits(p + 17);
+    int y = century * 100 + yr;
+    if ((century | yr) < 0 || y < 1 || m < 1 || m > 12 || d < 1 || unsigned(h) > 23 ||
+        unsigned(minute) > 59 || unsigned(second) > 59) return bad_time;
+    auto [year_days, leap] = years[y];
+    if (d > month_lengths[m - 1] + (m == 2 && leap)) return bad_time;
+    int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+    int offset = 0;
+    if (s.size() == 20) {
+        if (s[19] != 'Z') return bad_time;
+    } else {
+        if ((s[19] != '-' && s[19] != '+') || s[22] != ':') return bad_time;
+        int oh = two_digits(p + 20), om = two_digits(p + 23);
+        if (unsigned(oh) > 23 || unsigned(om) > 59) return bad_time;
+        offset = (oh * 60 + om) * (s[19] == '+' ? 1 : -1);
+    }
+    return int64_t(days) * day_ms + ((h * 60 + minute - offset) * 60 + second) * 1000;
+}
+
+int64_t ingest_timestamp(View s) {
+    // Ingest is F1 by contract. Use the same calendar with unchecked clock digits.
+    if (s.size() != 20) return bad_time;
+    auto pair = [](const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); };
+    const char* p = s.data();
+    int y = pair(p) * 100 + pair(p + 2), m = pair(p + 5), d = pair(p + 8);
+    if (unsigned(y) >= years.size() || unsigned(m - 1) >= 12) return bad_time;
+    auto [year_days, leap] = years[y];
+    int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+    return int64_t(days) * day_ms + ((pair(p + 11) * 60 + pair(p + 14)) * 60 + pair(p + 17)) * 1000;
+}
+
+int32_t utc_day(int64_t t) { return t / day_ms - (t % day_ms < 0); }
+
+struct Window {
+    int64_t start, end;
+    explicit Window(const fs::path& path) {
+        Mapping file(path);
+        auto read = [&](View key) {
+            View bytes = file.bytes();
+            size_t at = bytes.find(key);
+            if (at == View::npos) throw std::runtime_error("missing manifest field");
+            size_t colon = bytes.find(':', at + key.size());
+            size_t open = colon == View::npos ? View::npos : bytes.find('"', colon + 1);
+            size_t end = open == View::npos ? View::npos : bytes.find('"', open + 1);
+            if (end == View::npos) throw std::runtime_error("invalid manifest field");
+            return timestamp(bytes.substr(open + 1, end - open - 1));
+        };
+        start = read("\"window_start\"");
+        end = read("\"window_end\"");
+        if (start == bad_time || end == bad_time || start >= end)
+            throw std::runtime_error("invalid manifest window");
+    }
+};
+
+using Person = uint64_t;
+
+class Ids {
+    static constexpr uint64_t external = uint64_t{1} << 63;
+    static constexpr uint64_t multiplier = 0x94d049bb133111ebULL;
+    static constexpr uint64_t inverse = 0x319642b2d24d8ec3ULL;
+    static_assert(multiplier * inverse == 1);
+    struct Shard {
+        std::mutex lock;
+        StringMap<uint32_t> indices;
+        std::vector<View> names;
+    };
+    std::array<Shard, 64> shards_;
+
+    // Nonzero ASCII bytes take seven bits each. The zero padding distinguishes
+    // different lengths. Other byte strings use the high-bit tag and a shard index.
+    static uint64_t inline_id(View bytes) {
+        if (bytes.size() == 8 || bytes.size() == 9) {
+            uint64_t word;
+            std::memcpy(&word, bytes.data(), 8);
+            constexpr uint64_t high = 0x8080808080808080ULL;
+            if ((word & high) || ((word - 0x0101010101010101ULL) & ~word & high)) return 0;
+            uint64_t ninth = bytes.size() == 9 ? uint8_t(bytes[8]) : 0;
+            if (bytes.size() == 9 && (ninth == 0 || ninth > 127)) return 0;
+            word = (word & 0x007f007f007f007fULL) | ((word >> 1) & 0x3f803f803f803f80ULL);
+            word = (word & 0x00003fff00003fffULL) | ((word >> 2) & 0x0fffc0000fffc000ULL);
+            return (word & 0x0fffffffULL) | ((word >> 4) & 0x00fffffff0000000ULL) | (ninth << 56);
+        }
+        if (bytes.size() > 7) return 0;
+        uint64_t value = 0;
+        unsigned shift = 0;
+        for (uint8_t c : bytes) {
+            if (!c || c > 127) return 0;
+            value |= uint64_t(c) << shift;
+            shift += 7;
+        }
+        return value;
+    }
+
+public:
+    Person key(View bytes) {
+        uint64_t value = inline_id(bytes);
+        if (!value) {
+            size_t index = Hash{}(bytes) % shards_.size();
+            auto& shard = shards_[index];
+            std::lock_guard lock(shard.lock);
+            auto [position, inserted] = shard.indices.try_emplace(bytes, shard.names.size());
+            if (inserted) shard.names.push_back(bytes);
+            value = external | (uint64_t(index) << 32) | position->second;
+        }
+        value *= multiplier;
+        return value ^ (value >> 32);
+    }
+
+    // Called after the input stages have stopped interning IDs.
+    View name(Person key, char (&buffer)[9]) const {
+        uint64_t value = (key ^ (key >> 32)) * inverse;
+        if (value & external) return shards_[(value >> 32) & 63].names[uint32_t(value)];
+        uint64_t word = (value & 0x0fffffffULL) | ((value & 0x00fffffff0000000ULL) << 4);
+        word = (word & 0x00003fff00003fffULL) | ((word & 0x0fffc0000fffc000ULL) << 2);
+        word = (word & 0x007f007f007f007fULL) | ((word & 0x3f803f803f803f80ULL) << 1);
+        std::memcpy(buffer, &word, 8);
+        buffer[8] = value >> 56;
+        return View(buffer, buffer[8] ? 9 : (std::bit_width(word) + 7) / 8);
+    }
+};
+
+class People {
+    struct Alias { Person key = 0, value = 0; };
+    std::vector<Alias> aliases_ = std::vector<Alias>(32);
+
+    static size_t slot(const std::vector<Alias>& aliases, Person key) {
+        size_t mask = aliases.size() - 1;
+        size_t i = key & mask;
+        while (aliases[i].key && aliases[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+
+public:
+    People(const Input& links, Ids& ids) {
+        struct Member { View name; Person key; uint32_t parent, size; };
+        std::vector<Member> members;
+        auto add = [&](View name) {
+            Person key = ids.key(name);
+            size_t i = slot(aliases_, key);
+            if (aliases_[i].key) return uint32_t(aliases_[i].value);
+            if ((members.size() + 1) * 4 > aliases_.size() * 3) {
+                std::vector<Alias> grown(aliases_.size() * 2);
+                for (const auto& alias : aliases_)
+                    if (alias.key) grown[slot(grown, alias.key)] = alias;
+                aliases_.swap(grown);
+                i = slot(aliases_, key);
+            }
+            auto index = static_cast<uint32_t>(members.size());
+            aliases_[i] = {key, index};
+            members.push_back({name, key, index, 1});
+            return index;
+        };
+        auto root = [&](uint32_t i) {
+            while (i != members[i].parent) {
+                members[i].parent = members[members[i].parent].parent;
+                i = members[i].parent;
+            }
+            return i;
+        };
+        for (View chunk : links.chunks) scan<2>(chunk, [&](View, const Fields<2>& fields) {
+            if (fields[0].empty() || fields[1].empty()) return;
+            uint32_t a = root(add(fields[0])), b = root(add(fields[1]));
+            if (a == b) return;
+            if (members[a].size < members[b].size) std::swap(a, b);
+            members[b].parent = a;
+            members[a].size += members[b].size;
+            if (members[b].name < members[a].name) {
+                members[a].name = members[b].name;
+                members[a].key = members[b].key;
+            }
+        });
+        for (auto& alias : aliases_) if (alias.key) alias.value = members[root(alias.value)].key;
+    }
+
+    Person name(Person key) const {
+        auto value = aliases_[slot(aliases_, key)].value;
+        return value ? value : key;
+    }
+};
+
+struct Catalogs {
+    StringMap<uint32_t> products, campaign_ids;
+    std::vector<View> categories{"unknown"};
+    std::vector<View> campaigns{"organic"}, channels{"organic"};
+
+    Catalogs(const Input& product_input, const Input& campaign_input) {
+        StringMap<uint32_t> category_ids;
+        for (View chunk : product_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
+            auto [where, inserted] = category_ids.try_emplace(f[1], categories.size());
+            if (inserted) categories.push_back(f[1]);
+            products.emplace(f[0], where->second);
+        });
+        for (View chunk : campaign_input.chunks) scan<2>(chunk, [&](View, const Fields<2>& f) {
+            campaign_ids.emplace(f[0], campaigns.size());
+            campaigns.push_back(f[0]);
+            channels.push_back(f[1]);
+        });
+    }
+    uint32_t category(View product) const {
+        auto result = products.find(product);
+        return result == products.end() ? 0 : result->second;
+    }
+};
+
+struct Raw {
+    const char* line;
+    uint64_t layout;
+
+    static constexpr uint64_t long_row = uint64_t{1} << 63;
+    static constexpr uint64_t duplicate = uint64_t{1} << 62;
+
+    template<size_t N> Raw(View bytes, const Fields<N>& fields) : line(bytes.data()), layout(0) {
+        if (bytes.size() >= 128) {
+            layout = long_row | bytes.size();
+            return;
+        }
+        size_t start = 0;
+        for (size_t i = 0; i < N; ++i) {
+            size_t offset = fields[i].data() - line;
+            bool quoted = offset != start;
+            size_t end = offset + fields[i].size() + quoted;
+            layout |= (end | (uint64_t(quoted) << 7)) << (8 * i);
+            start = end + 1;
+        }
+    }
+
+    View field(size_t i) const {
+        if (layout & long_row) {
+            View rest(line, layout & ~(long_row | duplicate));
+            while (i--) rest.remove_prefix(rest.find(',') + 1);
+            View value = rest.substr(0, rest.find(','));
+            if (value.starts_with('"')) return value.substr(1, value.size() - 2);
+            return value;
+        }
+        return short_field(i);
+    }
+
+    View short_field(size_t i) const {
+        size_t start = i ? ((layout >> (8 * (i - 1))) & 127) + 1 : 0;
+        unsigned info = (layout >> (8 * i)) & 255;
+        size_t quoted = info >> 7;
+        return View(line + start + quoted, (info & 127) - start - 2 * quoted);
+    }
+
+    template<size_t N> Fields<N> fields() const {
+        Fields<N> result;
+        if (layout & long_row) split(View(line, layout & ~(long_row | duplicate)), result);
+        else for (size_t i = 0; i < N; ++i) result[i] = short_field(i);
+        return result;
+    }
+};
+struct Event { Person person; int64_t time; uint32_t price, category; };
+struct Click { Person person; View id; int64_t time; uint32_t campaign; };
+
+template<size_t N, class Record, class Validate>
+std::vector<Partitions<Record>> read_rows(const Input& input, unsigned threads, Validate validate) {
+    struct Entry { size_t hash; Raw* row; };
+    std::vector<std::vector<Raw>> raw(input.chunks.size());
+    std::vector<Partitions<Entry>> entries(threads);
+    parallel(threads, input.chunks.size(), [&](unsigned worker, size_t task) {
+        auto chunk = input.chunks[task];
+        auto& rows = raw[task];
+        rows.reserve(chunk.size() / (N == 7 ? 76 : 42));
+        scan<N>(chunk, [&](View line, const Fields<N>& f) {
+            if (!f[0].empty()) rows.emplace_back(line, f);
+        });
+        for (auto& row : rows) {
+            size_t hash = Hash{}(row.field(0));
+            entries[worker][hash % partition_count].push_back({hash, &row});
+        }
+    });
+
+    parallel(threads, partition_count, [&](unsigned, size_t bucket) {
+        size_t count = 0;
+        for (const auto& batch : entries) count += batch[bucket].size();
+        if (!count) return;
+        size_t capacity = std::bit_ceil(count + count / 2 + 1);
+        std::vector<Entry> table(capacity);
+        for (auto& batch : entries) {
+            for (const auto& entry : batch[bucket]) {
+                size_t pos = (entry.hash / partition_count) & (capacity - 1);
+                while (table[pos].row && (table[pos].hash != entry.hash ||
+                       table[pos].row->field(0) != entry.row->field(0)))
+                    pos = (pos + 1) & (capacity - 1);
+                auto& current = table[pos];
+                if (!current.row) {
+                    current = entry;
+                    continue;
+                }
+                if constexpr (N == 7) {
+                    if (entry.row->field(3) < current.row->field(3)) {
+                        current.row->layout |= Raw::duplicate;
+                        current = entry;
+                        continue;
+                    }
+                }
+                entry.row->layout |= Raw::duplicate;
+            }
+            std::vector<Entry>().swap(batch[bucket]);
+        }
+    });
+
+    std::vector<Partitions<Record>> records(threads);
+    parallel(threads, raw.size(), [&](unsigned worker, size_t chunk) {
+        for (const auto& row : raw[chunk]) {
+            if (!(row.layout & Raw::duplicate)) validate(row.fields<N>(), records[worker]);
+        }
+        std::vector<Raw>().swap(raw[chunk]);
+    });
+    return records;
+}
+
+template<class T, class Less>
+std::vector<T> collect_sorted(std::vector<Partitions<T>>& sources, size_t bucket, Less less) {
+    size_t total = 0;
+    for (const auto& batch : sources) total += batch[bucket].size();
+    constexpr unsigned radix_size = 256;
+    auto digit = [](Person person) { return unsigned(person >> 56); };
+    std::vector<T> result;
+    if (total < 512) {
+        result.reserve(total);
+        for (auto& batch : sources) {
+            auto& rows = batch[bucket];
+            result.insert(result.end(), rows.begin(), rows.end());
+            std::vector<T>().swap(rows);
+        }
+        std::sort(result.begin(), result.end(), less);
+        return result;
+    }
+    std::array<size_t, radix_size + 1> offsets{};
+    for (const auto& batch : sources)
+        for (const auto& row : batch[bucket]) ++offsets[digit(row.person) + 1];
+    for (size_t i = 1; i < offsets.size(); ++i) offsets[i] += offsets[i - 1];
+    auto next = offsets;
+    result.resize(total);
+    for (auto& batch : sources) {
+        auto& rows = batch[bucket];
+        for (const auto& row : rows) result[next[digit(row.person)]++] = row;
+        std::vector<T>().swap(rows);
+    }
+    for (size_t i = 0; i < radix_size; ++i)
+        std::sort(result.begin() + offsets[i], result.begin() + offsets[i + 1], less);
+    return result;
+}
+
+struct UserDaily {
+    Person user;
+    int32_t day;
+    uint32_t category;
+    int64_t sessions = 0, events = 0, revenue = 0;
+};
+struct CampaignDaily { int64_t sessions = 0, purchases = 0, revenue = 0, assists = 0; };
+using CampaignTotals = std::unordered_map<uint64_t, CampaignDaily>;
+
+uint64_t campaign_key(int32_t day, uint32_t campaign) {
+    return (uint64_t(uint32_t(day)) << 32) | campaign;
+}
+
+void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Catalogs& catalogs,
+               CampaignTotals& totals, std::vector<UserDaily>& users) {
+    std::vector<int64_t> spend(catalogs.categories.size());
+    std::vector<uint32_t> bought;
+    std::vector<uint32_t> counts(catalogs.campaigns.size()), positions(counts.size()), active;
+    size_t event = 0, click = 0;
+    while (event < events.size()) {
+        Person person = events[event].person;
+        while (click < clicks.size() && clicks[click].person < person) ++click;
+        size_t begin = click;
+        while (click < clicks.size() && clicks[click].person == person) ++click;
+        size_t first = begin, last = begin;
+        do {
+            int32_t day = utc_day(events[event].time);
+            UserDaily daily{person, day, no_category};
+            do {
+                int64_t start = events[event].time;
+                int64_t previous = start, revenue = 0;
+                size_t session = event;
+                do {
+                    const auto& row = events[event++];
+                    previous = row.time;
+                    if (row.price) {
+                        if (!spend[row.category]) bought.push_back(row.category);
+                        spend[row.category] += row.price;
+                        revenue += row.price;
+                    }
+                } while (event < events.size() && events[event].person == person &&
+                         events[event].time - previous <= gap_ms);
+                ++daily.sessions;
+                daily.events += event - session;
+                daily.revenue += revenue;
+
+                const int64_t lower = start - week_ms;
+                while (first < last && clicks[first].time < lower) {
+                    uint32_t campaign = clicks[first++].campaign;
+                    if (--counts[campaign] == 0) {
+                        uint32_t tail = active.back();
+                        active[positions[campaign]] = tail;
+                        positions[tail] = positions[campaign];
+                        active.pop_back();
+                    }
+                }
+                while (last < click && clicks[last].time <= start) {
+                    uint32_t campaign = clicks[last].campaign;
+                    if (clicks[last++].time < lower) {
+                        ++first;
+                        continue;
+                    }
+                    if (counts[campaign]++ == 0) {
+                        positions[campaign] = active.size();
+                        active.push_back(campaign);
+                    }
+                }
+                auto& credit = totals[campaign_key(day, first < last ? clicks[last - 1].campaign : 0)];
+                ++credit.sessions;
+                credit.purchases += revenue != 0;
+                credit.revenue += revenue;
+                for (uint32_t campaign : active) ++totals[campaign_key(day, campaign)].assists;
+            } while (event < events.size() && events[event].person == person &&
+                     utc_day(events[event].time) == day);
+
+            int64_t high = 0;
+            for (uint32_t category : bought) {
+                int64_t revenue = spend[category];
+                if (revenue > high || (revenue == high &&
+                    catalogs.categories[category] < catalogs.categories[daily.category])) {
+                    daily.category = category;
+                    high = revenue;
+                }
+                spend[category] = 0;
+            }
+            bought.clear();
+            users.push_back(daily);
+        } while (event < events.size() && events[event].person == person);
+        for (uint32_t campaign : active) counts[campaign] = 0;
+        active.clear();
+    }
+}
+
+using parquet::Column;
+constexpr Column user_schema[] = {{"user_id", Column::Text, 0}, {"day", Column::Int32, 6},
+    {"sessions", Column::Int64}, {"events", Column::Int64}, {"revenue_cents", Column::Int64},
+    {"top_category", Column::Text, 0, true}};
+constexpr Column campaign_schema[] = {{"campaign_id", Column::Text, 0}, {"channel", Column::Text, 0},
+    {"day", Column::Int32, 6}, {"sessions", Column::Int64}, {"purchasing_sessions", Column::Int64},
+    {"revenue_cents", Column::Int64}, {"assisted_sessions", Column::Int64}};
+constexpr size_t group_rows = 32768;
+
+void write_users(parquet::File& file, std::span<const UserDaily> users, const Catalogs& catalogs,
+                 const Ids& ids) {
+    using parquet::little_endian;
+    using parquet::plain;
+    while (!users.empty()) {
+        auto group = users.first(std::min(group_rows, users.size()));
+        file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
+            if (column == 5) parquet::definitions(bytes, group.size(), [&](size_t i) {
+                return group[i].category != no_category;
+            });
+            for (const auto& row : group) {
+                switch (column) {
+                    case 0: {
+                        char buffer[9];
+                        plain(bytes, ids.name(row.user, buffer));
+                        break;
+                    }
+                    case 1: little_endian(bytes, row.day); break;
+                    case 2: little_endian(bytes, row.sessions); break;
+                    case 3: little_endian(bytes, row.events); break;
+                    case 4: little_endian(bytes, row.revenue); break;
+                    case 5: if (row.category != no_category) plain(bytes, catalogs.categories[row.category]); break;
+                }
+            }
+        });
+        users = users.subspan(group.size());
+    }
+}
+
+void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs) {
+    using parquet::little_endian;
+    using parquet::plain;
+    std::vector<uint64_t> keys;
+    keys.reserve(totals.size());
+    for (const auto& [key, row] : totals) keys.push_back(key);
+    std::sort(keys.begin(), keys.end());
+    parquet::File file(path, campaign_schema);
+    for (size_t offset = 0; offset < keys.size(); offset += group_rows) {
+        auto group = std::span(keys).subspan(offset, std::min(group_rows, keys.size() - offset));
+        file.append(group.size(), [&](size_t column, parquet::Bytes& bytes) {
+            for (uint64_t key : group) {
+                uint32_t campaign = key;
+                const auto& row = totals.at(key);
+                switch (column) {
+                    case 0: plain(bytes, catalogs.campaigns[campaign]); break;
+                    case 1: plain(bytes, catalogs.channels[campaign]); break;
+                    case 2: little_endian(bytes, static_cast<int32_t>(key >> 32)); break;
+                    case 3: little_endian(bytes, row.sessions); break;
+                    case 4: little_endian(bytes, row.purchases); break;
+                    case 5: little_endian(bytes, row.revenue); break;
+                    case 6: little_endian(bytes, row.assists); break;
+                }
+            }
+        });
+    }
+    file.finish();
+}
+
+std::string env(const char* key, const char* fallback) {
+    const char* value = std::getenv(key);
+    return value && *value ? value : fallback;
+}
+
+int main(int argc, char** argv) try {
+    unsigned threads = 8;
+    auto ncpu = env("NCPU", "8");
+    auto parsed = std::from_chars(ncpu.data(), ncpu.data() + ncpu.size(), threads);
+    if (parsed.ec != std::errc()) throw std::runtime_error("invalid NCPU");
+    threads = std::clamp(threads, 1u, 8u);
+    fs::path data = argc > 1 ? argv[1] : env("DATA_DIR", "/data");
+    fs::path out = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
+    bool trace = std::getenv("SHOPPING_TRACE") != nullptr;
+    if (trace) {
+        constexpr const char* names[] = {"scalar", "NEON", "AVX2", "AVX-512BW"};
+        std::fprintf(stderr, "CSV %s\n", names[static_cast<unsigned>(scanner)]);
+    }
+    auto start = std::chrono::steady_clock::now();
+    auto mark = [&](const char* name) {
+        if (trace) {
+            auto now = std::chrono::steady_clock::now();
+            double seconds = std::chrono::duration<double>(now - start).count();
+            std::fprintf(stderr, "%s %.4fs\n", name, seconds);
+            start = now;
+        }
+    };
+    const Window window(data / "manifest.json");
+    const Input links(data / "links", true), products(data / "products.csv", false),
+        campaigns(data / "campaigns.csv", false), event_input(data / "events", true),
+        click_input(data / "clicks", true);
+    Ids ids;
+    const People people(links, ids);
+    const Catalogs catalogs(products, campaigns);
+    mark("setup");
+
+    auto events = read_rows<7, Event>(event_input, threads, [&](const Fields<7>& f, auto& partitions) {
+        if (f[1].empty() || f[5].empty()) return;
+        bool purchase = f[4] == "purchase";
+        if (!purchase && f[4] != "view" && f[4] != "cart") return;
+        int64_t time = timestamp(f[2]);
+        if (time < window.start || time >= window.end) return;
+        int64_t price = purchase ? decimal(f[6], 10'000'000) : 0;
+        if (purchase && price <= 0) return;
+        int64_t ingest = ingest_timestamp(f[3]);
+        if (ingest == bad_time || ingest - time > day_ms) return;
+        Person person = people.name(ids.key(f[1]));
+        partitions[person % partition_count].push_back({person, time,
+            static_cast<uint32_t>(price), purchase ? catalogs.category(f[5]) : 0});
+    });
+    mark("events");
+    auto clicks = read_rows<4, Click>(click_input, threads, [&](const Fields<4>& f, auto& partitions) {
+        if (f[1].empty()) return;
+        int64_t time = timestamp(f[3]);
+        if (time < window.start - week_ms || time >= window.end) return;
+        auto campaign = catalogs.campaign_ids.find(f[2]);
+        if (campaign == catalogs.campaign_ids.end()) return;
+        Person person = people.name(ids.key(f[1]));
+        partitions[person % partition_count].push_back({person, f[0], time, campaign->second});
+    });
+    mark("clicks");
+
+    fs::create_directories(out / "user_daily");
+    fs::create_directories(out / "campaign_daily");
+    std::vector<std::unique_ptr<parquet::File>> writers(threads);
+    std::vector<CampaignTotals> campaign_totals(threads);
+    parallel(threads, partition_count, [&](unsigned worker, size_t bucket) {
+        auto ev = collect_sorted(events, bucket, [](const Event& a, const Event& b) {
+            return a.person == b.person ? a.time < b.time : a.person < b.person;
+        });
+        auto cl = collect_sorted(clicks, bucket, [](const Click& a, const Click& b) {
+            if (a.person != b.person) return a.person < b.person;
+            return a.time == b.time ? a.id > b.id : a.time < b.time;
+        });
+        if (ev.empty()) return;
+        std::vector<UserDaily> users;
+        aggregate(ev, cl, catalogs, campaign_totals[worker], users);
+        auto& writer = writers[worker];
+        if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
+            ("part-" + std::to_string(worker) + ".parquet"), user_schema);
+        write_users(*writer, users, catalogs, ids);
+    });
+    mark("sessions and user output");
+
+    if (std::none_of(writers.begin(), writers.end(), [](const auto& file) { return bool(file); }))
+        writers[0] = std::make_unique<parquet::File>(out / "user_daily" / "part-0.parquet", user_schema);
+    for (auto& file : writers) if (file) file->finish();
+    auto& totals = campaign_totals.front();
+    for (unsigned i = 1; i < threads; ++i) for (const auto& [key, from] : campaign_totals[i]) {
+        auto& to = totals[key];
+        to.sessions += from.sessions;
+        to.purchases += from.purchases;
+        to.revenue += from.revenue;
+        to.assists += from.assists;
+    }
+    write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
+    mark("finish");
+    return 0;
+} catch (const std::exception& error) {
+    std::fprintf(stderr, "%s\n", error.what());
+    return 1;
+}
