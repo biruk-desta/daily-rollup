@@ -1387,23 +1387,6 @@ uint64_t positive_env(const char* key, const char* fallback) {
     return value;
 }
 
-void cap_memory(uint64_t gb) {
-    constexpr uint64_t gib = uint64_t{1} << 30;
-    if (gb > std::numeric_limits<rlim_t>::max() / gib)
-        throw std::runtime_error("invalid MEM_GB");
-#if defined(__linux__)
-    // The scorer also enforces a cgroup memory limit. Bound our own mapped
-    // address space so an undersized budget fails through the allocation path.
-    rlimit limit{};
-    if (getrlimit(RLIMIT_AS, &limit) != 0) throw std::runtime_error("cannot read memory limit");
-    rlim_t budget = gb * gib;
-    if (budget < limit.rlim_cur) {
-        limit.rlim_cur = budget;
-        if (setrlimit(RLIMIT_AS, &limit) != 0) throw std::runtime_error("cannot set MEM_GB");
-    }
-#endif
-}
-
 template<class Candidate>
 void process(const Window& window, const Input& links, const Catalogs& catalogs,
              const Input& event_input, const Input& click_input, const fs::path& out,
