@@ -1199,7 +1199,6 @@ void cap_memory(uint64_t gb) {
 int main(int argc, char** argv) try {
     Trace trace;
     unsigned threads = std::min<uint64_t>(8, positive_env("NCPU", "8"));
-    cap_memory(positive_env("MEM_GB", "24"));
     fs::path data = argc > 1 ? argv[1] : env("DATA_DIR", "/data");
     fs::path out = argc > 2 ? argv[2] : env("OUTPUT_DIR", "/output");
     const Window window(data / "manifest.json");
