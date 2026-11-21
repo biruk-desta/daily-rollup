@@ -801,6 +801,72 @@ struct WideCandidate {
 
 };
 
+// First-touch storage for a scan worker. A skewed bucket can exceed its
+// estimate without moving the records already in the mapping.
+template<class Candidate> class CandidateArena {
+    struct Bucket {
+        size_t used = 0;
+        std::vector<Candidate> overflow;
+    };
+    std::array<Bucket, event_buckets> buckets_;
+    Candidate* rows_ = nullptr;
+    size_t bytes_ = 0, capacity_ = 0;
+
+public:
+    explicit CandidateArena(size_t capacity) {
+        if (!capacity) return;
+        size_t bytes = capacity * event_buckets * sizeof(Candidate);
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        constexpr size_t huge_page = 2 << 20;
+        if (bytes >= huge_page) {
+            // Linux can only promote the aligned, complete pages in this arena.
+            size_t page = sysconf(_SC_PAGESIZE);
+            bytes = (bytes + page - 1) / page * page;
+            void* base = mmap(nullptr, bytes + huge_page, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED) return;
+            size_t prefix = (huge_page - (reinterpret_cast<uintptr_t>(base) % huge_page)) % huge_page;
+            auto* address = static_cast<std::byte*>(base) + prefix;
+            if (prefix) munmap(base, prefix);
+            munmap(address + bytes, huge_page - prefix);
+            madvise(address, bytes, MADV_HUGEPAGE);
+            rows_ = reinterpret_cast<Candidate*>(address);
+        } else
+#endif
+        {
+            void* address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (address == MAP_FAILED) return;
+            rows_ = static_cast<Candidate*>(address);
+        }
+        bytes_ = bytes;
+        capacity_ = capacity;
+    }
+
+    CandidateArena(const CandidateArena&) = delete;
+    CandidateArena& operator=(const CandidateArena&) = delete;
+    ~CandidateArena() { if (rows_) munmap(rows_, bytes_); }
+
+    void append(size_t index, uint64_t id, int64_t ingest, Event event, const Window& window) {
+        auto& bucket = buckets_[index];
+        if (bucket.used < capacity_)
+            std::construct_at(rows_ + index * capacity_ + bucket.used++, id, ingest, event, window);
+        else
+            bucket.overflow.emplace_back(id, ingest, event, window);
+    }
+
+    size_t size(size_t index) const {
+        const auto& bucket = buckets_[index];
+        return bucket.used + bucket.overflow.size();
+    }
+
+    std::array<std::span<const Candidate>, 2> blocks(size_t index) const {
+        const auto& bucket = buckets_[index];
+        const auto* first = rows_ ? rows_ + index * capacity_ : nullptr;
+        return {std::span(first, bucket.used), std::span(bucket.overflow)};
+    }
+};
+
 EventValue unpack(uint64_t value, const Window& window) {
     return {window.start + int64_t(value >> 32), uint32_t(value) & price_mask, uint32_t(value) >> 24};
 }
@@ -827,7 +893,12 @@ read_events(const Input& input, unsigned threads, Trace& trace,
                                            const Input& links, Ids& ids,
                                            std::optional<People>& people) {
     Ids event_ids;
-    std::vector<std::array<std::vector<Candidate>, event_buckets>> entries(threads);
+    size_t estimated_rows = 0;
+    for (View chunk : input.chunks) estimated_rows += chunk.size() / 64;
+    size_t capacity_per_bucket = estimated_rows / (threads * event_buckets);
+    std::vector<std::unique_ptr<CandidateArena<Candidate>>> entries;
+    for (unsigned i = 0; i < threads; ++i)
+        entries.push_back(std::make_unique<CandidateArena<Candidate>>(capacity_per_bucket));
     parallel(threads, input.chunks.size() + 1, [&](unsigned worker, size_t task) {
         if (task == 0) {
             people.emplace(links, ids);
@@ -839,7 +910,7 @@ read_events(const Input& input, unsigned threads, Trace& trace,
             int64_t ingest = ingest_timestamp(fields[3]);
             // Keep invalid copies in the same competition for earliest ingest.
             Event event = parse_event(fields, window, catalogs, ids, ingest);
-            entries[worker][id % event_buckets].emplace_back(id, ingest, event, window);
+            entries[worker]->append(id % event_buckets, id, ingest, event, window);
         });
     });
     trace.mark("event_ingest_links_catalogs");
@@ -847,21 +918,26 @@ read_events(const Input& input, unsigned threads, Trace& trace,
     std::vector<Partitions<typename Candidate::Survivor>> records(threads);
     parallel(threads, event_buckets, [&](unsigned worker, size_t bucket) {
         size_t count = 0;
-        for (const auto& batch : entries) count += batch[bucket].size();
+        for (const auto& batch : entries) count += batch->size(bucket);
         if (!count) return;
         // Equal IDs share a slot. Collisions can only add candidates to exact deduplication.
         size_t filter_size = std::max<size_t>(64, std::bit_ceil(count * 8));
         std::vector<uint64_t> seen(filter_size / 64), repeated(filter_size / 64);
         auto filter_slot = [&](uint64_t id) { return (id / event_buckets) & (filter_size - 1); };
         size_t candidates = 0;
-        for (const auto& batch : entries) for (const Candidate& entry : batch[bucket]) {
+        auto visit = [&](auto use) {
+            for (const auto& batch : entries)
+                for (auto block : batch->blocks(bucket))
+                    for (const Candidate& entry : block) use(entry);
+        };
+        visit([&](const Candidate& entry) {
             size_t i = filter_slot(entry.id);
             uint64_t bit = uint64_t{1} << (i % 64);
             bool collision = seen[i / 64] & bit;
             candidates += collision + (collision && !(repeated[i / 64] & bit));
             repeated[i / 64] |= seen[i / 64] & bit;
             seen[i / 64] |= bit;
-        }
+        });
         auto emit = [&](const Candidate& entry) {
             auto event = entry.payload;
             if (!event.person) return;
@@ -870,19 +946,19 @@ read_events(const Input& input, unsigned threads, Trace& trace,
         };
         size_t capacity = std::bit_ceil(candidates + candidates / 2 + 1);
         std::vector<const Candidate*> table(capacity);
-        for (const auto& batch : entries) for (const Candidate& entry : batch[bucket]) {
+        visit([&](const Candidate& entry) {
             size_t i = filter_slot(entry.id);
             if (!(repeated[i / 64] & (uint64_t{1} << (i % 64)))) {
                 emit(entry);
-                continue;
+                return;
             }
             size_t pos = (entry.id / event_buckets) & (capacity - 1);
             while (table[pos] && table[pos]->id != entry.id) pos = (pos + 1) & (capacity - 1);
             if (!table[pos] || entry.ingest < table[pos]->ingest) table[pos] = &entry;
-        }
+        });
         for (auto* winner : table) if (winner) emit(*winner);
-        for (auto& batch : entries) std::vector<Candidate>().swap(batch[bucket]);
     });
+    parallel(threads, entries.size(), [&](unsigned, size_t i) { entries[i].reset(); });
     trace.mark("event_dedup_route");
     return records;
 }
