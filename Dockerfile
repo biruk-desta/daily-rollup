@@ -8,7 +8,7 @@ RUN case "$TARGETARCH:$(dpkg --print-architecture)" in \
     apt-get install -y -qq --no-install-recommends "$package" && \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-COPY main.cpp parquet.hpp detail_trace.hpp build.sh train-profile.sh ./
+COPY main.cpp parquet.hpp detail_trace.hpp csv_index.hpp build.sh train-profile.sh ./
 ARG SHOPPING_PGO=gcc
 RUN if [ "$(dpkg --print-architecture)" = amd64 ]; then compiler=g++; \
     else compiler=x86_64-linux-gnu-g++; fi && \

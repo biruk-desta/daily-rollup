@@ -374,11 +374,20 @@ template<size_t N, class Row> void scan_neon(View chunk, Row row) {
 }
 #endif
 
+#include "csv_index.hpp"
+
 template<size_t N, class Row> void scan(View chunk, Row row) {
 #if defined(__x86_64__)
+    if constexpr (N >= 4) {
+        if (scanner == Scanner::Avx512) return scan_indexed<N, csv_avx512>(chunk, row);
+        if (scanner == Scanner::Avx2) return scan_indexed<N, csv_avx2>(chunk, row);
+    }
     if (scanner == Scanner::Avx512) return scan_avx512<N>(chunk, row);
     if (scanner == Scanner::Avx2) return scan_avx2<N>(chunk, row);
 #elif defined(__aarch64__)
+    if constexpr (N >= 4) {
+        if (scanner == Scanner::Neon) return scan_indexed<N, csv_neon>(chunk, row);
+    }
     if (scanner == Scanner::Neon) return scan_neon<N>(chunk, row);
 #endif
     scan_scalar<N>(chunk, row);
