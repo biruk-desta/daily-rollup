@@ -5,6 +5,7 @@
 #include <atomic>
 #include <charconv>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -608,7 +609,7 @@ class Ids {
     struct Shard {
         std::mutex lock;
         StringMap<uint32_t> indices;
-        std::vector<View> names;
+        std::deque<std::string> names;
         size_t longest = 0;
     };
     std::array<Shard, 64> shards_;
@@ -645,9 +646,12 @@ public:
             size_t index = Hash{}(bytes) % shards_.size();
             auto& shard = shards_[index];
             std::lock_guard lock(shard.lock);
-            auto [position, inserted] = shard.indices.try_emplace(bytes, shard.names.size());
-            if (inserted) {
-                shard.names.push_back(bytes);
+            auto position = shard.indices.find(bytes);
+            if (position == shard.indices.end()) {
+                if (shard.names.size() > UINT32_MAX) throw std::runtime_error("too many distinct IDs");
+                auto number = static_cast<uint32_t>(shard.names.size());
+                shard.names.emplace_back(bytes);
+                position = shard.indices.emplace(shard.names.back(), number).first;
                 shard.longest = std::max(shard.longest, bytes.size());
             }
             value = external | (uint64_t(index) << 32) | position->second;
@@ -759,140 +763,120 @@ struct Catalogs {
     }
 };
 
-struct Raw {
-    const char* line;
-    uint64_t layout;
-
-    static constexpr uint64_t long_row = uint64_t{1} << 63;
-    static constexpr uint64_t duplicate = uint64_t{1} << 62;
-
-    template<size_t N> Raw(View bytes, const Fields<N>& fields) : line(bytes.data()), layout(0) {
-        if (bytes.size() >= 128) {
-            layout = long_row | bytes.size();
-            return;
-        }
-        size_t start = 0;
-        for (size_t i = 0; i < N; ++i) {
-            size_t offset = fields[i].data() - line;
-            bool quoted = offset != start;
-            size_t end = offset + fields[i].size() + quoted;
-            layout |= (end | (uint64_t(quoted) << 7)) << (8 * i);
-            start = end + 1;
-        }
-    }
-
-    View field(size_t i) const {
-        if (layout & long_row) {
-            View rest(line, layout & ~(long_row | duplicate));
-            while (i--) rest.remove_prefix(rest.find(',') + 1);
-            View value = rest.substr(0, rest.find(','));
-            if (value.starts_with('"')) return value.substr(1, value.size() - 2);
-            return value;
-        }
-        return short_field(i);
-    }
-
-    View short_field(size_t i) const {
-        size_t start = i ? ((layout >> (8 * (i - 1))) & 127) + 1 : 0;
-        unsigned info = (layout >> (8 * i)) & 255;
-        size_t quoted = info >> 7;
-        return View(line + start + quoted, (info & 127) - start - 2 * quoted);
-    }
-
-    template<size_t N> Fields<N> fields() const {
-        Fields<N> result;
-        if (layout & long_row) split(View(line, layout & ~(long_row | duplicate)), result);
-        else for (size_t i = 0; i < N; ++i) result[i] = short_field(i);
-        return result;
-    }
-};
 struct Event { Person person; int64_t time; uint32_t price, category; };
 struct Click { Person person; View id; int64_t time; uint32_t campaign; };
 
+constexpr unsigned event_buckets = 256;
+constexpr uint32_t price_mask = (1u << 24) - 1;
 
-template<class Setup, class Validate>
+bool compact_events(const Window& window, const Catalogs& catalogs) {
+    return uint64_t(window.end) - uint64_t(window.start) <= UINT32_MAX &&
+           catalogs.categories.size() <= 256;
+}
+
+struct CompactCandidate {
+    uint64_t id;
+    int64_t ingest;
+    Person user;
+    uint32_t time, purchase;
+
+    CompactCandidate(uint64_t id, int64_t ingest, Event event, const Window& window)
+        : id(id), ingest(ingest), user(event.person),
+          time(event.person ? static_cast<uint32_t>(event.time - window.start) : 0),
+          purchase(event.price | (event.category << 24)) {}
+
+    Event event(const Window& window) const {
+        return {user, window.start + time, purchase & price_mask, purchase >> 24};
+    }
+};
+
+struct WideCandidate {
+    uint64_t id;
+    int64_t ingest;
+    Event payload;
+
+    WideCandidate(uint64_t id, int64_t ingest, Event event, const Window&)
+        : id(id), ingest(ingest), payload(event) {}
+
+    Event event(const Window&) const { return payload; }
+};
+
+Event parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
+                  Ids& ids, int64_t ingest) {
+    if (fields[1].empty() || fields[5].empty() || ingest == bad_time) return {};
+    bool purchase = fields[4] == "purchase";
+    if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
+    int64_t time = timestamp(fields[2]);
+    if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
+    int64_t price = purchase ? decimal(fields[6], 10'000'000) : 0;
+    if (purchase && price <= 0) return {};
+    return {ids.key(fields[1]), time, static_cast<uint32_t>(price),
+            purchase ? catalogs.category(fields[5]) : 0};
+}
+
+template<class Candidate>
 std::vector<Partitions<Event>> read_events(const Input& input, unsigned threads, Trace& trace,
-                                         Setup setup, Validate validate) {
-    constexpr size_t setup_tasks = 2;
-    struct Entry { size_t hash; Raw* row; };
-    std::vector<std::vector<Raw>> raw(input.chunks.size());
-    std::vector<Partitions<Entry>> entries(threads);
-    parallel(threads, input.chunks.size() + setup_tasks, [&](unsigned worker, size_t task) {
-        if (task < setup_tasks) {
-            setup(task);
+                                           const Window& window, const Catalogs& catalogs,
+                                           const Input& links, Ids& ids,
+                                           std::optional<People>& people) {
+    Ids event_ids;
+    std::vector<std::array<std::vector<Candidate>, event_buckets>> entries(threads);
+    parallel(threads, input.chunks.size() + 1, [&](unsigned worker, size_t task) {
+        if (task == 0) {
+            people.emplace(links, ids);
             return;
         }
-        task -= setup_tasks;
-        auto chunk = input.chunks[task];
-        auto& rows = raw[task];
-        rows.reserve(chunk.size() / 68);
-        scan<7>(chunk, [&](View line, const Fields<7>& f) {
-            if (!f[0].empty()) rows.emplace_back(line, f);
+        scan<7>(input.chunks[task - 1], [&](View, const Fields<7>& fields) {
+            if (fields[0].empty()) return;
+            uint64_t id = event_ids.key(fields[0]);
+            int64_t ingest = ingest_timestamp(fields[3]);
+            // Keep invalid copies in the same competition for earliest ingest.
+            Event event = parse_event(fields, window, catalogs, ids, ingest);
+            entries[worker][id % event_buckets].emplace_back(id, ingest, event, window);
         });
-        for (auto& row : rows) {
-            size_t hash = Hash{}(row.field(0));
-            entries[worker][hash % partition_count].push_back({hash, &row});
-        }
     });
-    trace.mark("event_scan_links_catalogs");
+    trace.mark("event_ingest_links_catalogs");
 
-    parallel(threads, partition_count, [&](unsigned, size_t bucket) {
+    std::vector<Partitions<Event>> records(threads);
+    parallel(threads, event_buckets, [&](unsigned worker, size_t bucket) {
         size_t count = 0;
         for (const auto& batch : entries) count += batch[bucket].size();
         if (!count) return;
         // Equal IDs share a slot. Collisions can only add candidates to exact deduplication.
         size_t filter_size = std::max<size_t>(64, std::bit_ceil(count * 8));
         std::vector<uint64_t> seen(filter_size / 64), repeated(filter_size / 64);
-        auto filter_slot = [&](size_t hash) { return (hash / partition_count) & (filter_size - 1); };
-        for (const auto& batch : entries) for (const Entry& entry : batch[bucket]) {
-            size_t i = filter_slot(entry.hash);
+        auto filter_slot = [&](uint64_t id) { return (id / event_buckets) & (filter_size - 1); };
+        size_t candidates = 0;
+        for (const auto& batch : entries) for (const Candidate& entry : batch[bucket]) {
+            size_t i = filter_slot(entry.id);
             uint64_t bit = uint64_t{1} << (i % 64);
+            bool collision = seen[i / 64] & bit;
+            candidates += collision + (collision && !(repeated[i / 64] & bit));
             repeated[i / 64] |= seen[i / 64] & bit;
             seen[i / 64] |= bit;
         }
-        size_t candidates = 0;
-        for (auto& batch : entries) {
-            auto& list = batch[bucket];
-            auto end = std::remove_if(list.begin(), list.end(), [&](const Entry& entry) {
-                size_t i = filter_slot(entry.hash);
-                return !(repeated[i / 64] & (uint64_t{1} << (i % 64)));
-            });
-            list.erase(end, list.end());
-            candidates += list.size();
-        }
+        auto emit = [&](const Candidate& entry) {
+            Event event = entry.event(window);
+            if (!event.person) return;
+            event.person = people->name(event.person);
+            records[worker][event.person % partition_count].push_back(event);
+        };
         size_t capacity = std::bit_ceil(candidates + candidates / 2 + 1);
-        std::vector<Entry> table(capacity);
-        for (auto& batch : entries) {
-            for (const auto& entry : batch[bucket]) {
-                size_t pos = (entry.hash / partition_count) & (capacity - 1);
-                while (table[pos].row && (table[pos].hash != entry.hash ||
-                       table[pos].row->field(0) != entry.row->field(0)))
-                    pos = (pos + 1) & (capacity - 1);
-                auto& current = table[pos];
-                if (!current.row) {
-                    current = entry;
-                    continue;
-                }
-                if (entry.row->field(3) < current.row->field(3)) {
-                    current.row->layout |= Raw::duplicate;
-                    current = entry;
-                } else {
-                    entry.row->layout |= Raw::duplicate;
-                }
+        std::vector<const Candidate*> table(capacity);
+        for (const auto& batch : entries) for (const Candidate& entry : batch[bucket]) {
+            size_t i = filter_slot(entry.id);
+            if (!(repeated[i / 64] & (uint64_t{1} << (i % 64)))) {
+                emit(entry);
+                continue;
             }
-            std::vector<Entry>().swap(batch[bucket]);
+            size_t pos = (entry.id / event_buckets) & (capacity - 1);
+            while (table[pos] && table[pos]->id != entry.id) pos = (pos + 1) & (capacity - 1);
+            if (!table[pos] || entry.ingest < table[pos]->ingest) table[pos] = &entry;
         }
+        for (auto* winner : table) if (winner) emit(*winner);
+        for (auto& batch : entries) std::vector<Candidate>().swap(batch[bucket]);
     });
-    trace.mark("event_dedup");
-
-    std::vector<Partitions<Event>> records(threads);
-    parallel(threads, raw.size(), [&](unsigned worker, size_t chunk) {
-        for (const auto& row : raw[chunk]) {
-            if (!(row.layout & Raw::duplicate)) validate(row.fields<7>(), records[worker]);
-        }
-        std::vector<Raw>().swap(raw[chunk]);
-    });
-    trace.mark("event_validation");
+    trace.mark("event_dedup_route");
     return records;
 }
 
@@ -1208,31 +1192,16 @@ int main(int argc, char** argv) try {
     trace.mark("mappings");
     Ids ids;
     std::optional<People> people;
-    std::optional<Catalogs> catalogs;
-    auto setup = [&](size_t task) {
-        if (task == 0) people.emplace(links, ids);
-        else catalogs.emplace(products, campaigns);
-    };
-    auto events = read_events(event_input, threads, trace, setup, [&](const Fields<7>& f, auto& partitions) {
-        if (f[1].empty() || f[5].empty()) return;
-        bool purchase = f[4] == "purchase";
-        if (!purchase && f[4] != "view" && f[4] != "cart") return;
-        int64_t time = timestamp(f[2]);
-        if (time < window.start || time >= window.end) return;
-        int64_t price = purchase ? decimal(f[6], 10'000'000) : 0;
-        if (purchase && price <= 0) return;
-        int64_t ingest = ingest_timestamp(f[3]);
-        if (ingest == bad_time || ingest - time > day_ms) return;
-        Person person = people->name(ids.key(f[1]));
-        partitions[person % partition_count].push_back({person, time,
-            static_cast<uint32_t>(price), purchase ? catalogs->category(f[5]) : 0});
-    });
+    const Catalogs catalogs(products, campaigns);
+    auto events = compact_events(window, catalogs)
+        ? read_events<CompactCandidate>(event_input, threads, trace, window, catalogs, links, ids, people)
+        : read_events<WideCandidate>(event_input, threads, trace, window, catalogs, links, ids, people);
     auto clicks = read_clicks(click_input, threads, trace, [&](const Fields<4>& f, auto& partitions) {
         if (f[1].empty()) return;
         int64_t time = timestamp(f[3]);
         if (time < window.start - week_ms || time >= window.end) return;
-        auto campaign = catalogs->campaign_ids.find(f[2]);
-        if (campaign == catalogs->campaign_ids.end()) return;
+        auto campaign = catalogs.campaign_ids.find(f[2]);
+        if (campaign == catalogs.campaign_ids.end()) return;
         Person person = people->name(ids.key(f[1]));
         partitions[person % partition_count].push_back({person, f[0], time, campaign->second});
     });
@@ -1240,11 +1209,11 @@ int main(int argc, char** argv) try {
     fs::create_directories(out / "user_daily");
     fs::create_directories(out / "campaign_daily");
     size_t user_group_rows = parquet::row_group_limit(
-        std::max(ids.longest(), longest_string(catalogs->categories)));
+        std::max(ids.longest(), longest_string(catalogs.categories)));
     std::vector<std::unique_ptr<parquet::File>> writers(threads);
     std::vector<CampaignTotals> campaign_totals;
     campaign_totals.reserve(threads);
-    for (unsigned i = 0; i < threads; ++i) campaign_totals.emplace_back(window, catalogs->campaigns.size());
+    for (unsigned i = 0; i < threads; ++i) campaign_totals.emplace_back(window, catalogs.campaigns.size());
     parallel(threads, partition_count, [&](unsigned worker, size_t bucket) {
         auto ev = collect_sorted(events, bucket, [](const Event& a, const Event& b) {
             return a.person == b.person ? a.time < b.time : a.person < b.person;
@@ -1255,11 +1224,11 @@ int main(int argc, char** argv) try {
         });
         if (ev.empty()) return;
         std::vector<UserDaily> users;
-        aggregate(ev.view(), cl.view(), *catalogs, campaign_totals[worker], users);
+        aggregate(ev.view(), cl.view(), catalogs, campaign_totals[worker], users);
         auto& writer = writers[worker];
         if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
             ("part-" + std::to_string(worker) + ".parquet"), user_schema);
-        write_users(*writer, users, *catalogs, ids, user_group_rows);
+        write_users(*writer, users, catalogs, ids, user_group_rows);
     });
     trace.mark("sessions_user_output");
 
@@ -1272,7 +1241,7 @@ int main(int argc, char** argv) try {
         }
         auto& totals = campaign_totals.front();
         for (unsigned i = 1; i < threads; ++i) totals.merge(campaign_totals[i]);
-        write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, *catalogs);
+        write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
     });
     trace.mark("finish");
     _exit(0);
