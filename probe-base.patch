@@ -1,0 +1,192 @@
+--- a/main.cpp
++++ b/main.cpp
+@@ -127,6 +127,7 @@
+     std::mutex error_mutex;
+     std::exception_ptr error;
+     auto run = [&](unsigned worker) {
++        SHOPPING_TIME(timing::Local local;)
+         try {
+             for (size_t task; (task = next.fetch_add(1, std::memory_order_relaxed)) < tasks;)
+                 work(worker, task);
+@@ -202,6 +203,7 @@
+     bool enabled_ = std::getenv("SHOPPING_TRACE") != nullptr;
+     int64_t time_ = 0;
+     rusage usage_{};
++    SHOPPING_COUNT(timing::Hardware hardware_;)
+ 
+     static int64_t micros(timeval t) { return int64_t(t.tv_sec) * 1'000'000 + t.tv_usec; }
+ 
+@@ -211,6 +213,7 @@
+         constexpr const char* names[] = {"scalar", "NEON", "AVX2", "AVX-512BW"};
+         std::fprintf(stderr, "CSV %s\n", names[static_cast<unsigned>(scanner)]);
+         std::fprintf(stderr, "trace columns: phase, monotonic_ns, wall_s, cpu_s, minor_faults, major_faults\n");
++        SHOPPING_TIME(timing::calibrate();)
+         mark("start");
+     }
+ 
+@@ -228,6 +231,7 @@
+             double(cpu) / 1e6, usage.ru_minflt - usage_.ru_minflt, usage.ru_majflt - usage_.ru_majflt);
+         time_ = time;
+         usage_ = usage;
++        SHOPPING_COUNT(hardware_.mark(phase);)
+     }
+ 
+ };
+@@ -940,7 +944,8 @@
+ 
+ template<class Category>
+ Event<Category> parse_event(const Fields<7>& fields, const Window& window, const Catalogs& catalogs,
+-                            Ids& ids, int64_t ingest) {
++                            Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
++    SHOPPING_TIME(timing::Scope validation(timing::Validate, weight);)
+     if (fields[1].empty() || fields[5].empty() || ingest == bad_time) return {};
+     bool purchase = fields[4] == "purchase";
+     if (!purchase && fields[4] != "view" && fields[4] != "cart") return {};
+@@ -948,7 +953,12 @@
+     if (time < window.start || time >= window.end || time < ingest - day_ms) return {};
+     int64_t price = purchase ? decimal(fields[6], 10'000'000) : 0;
+     if (purchase && price <= 0) return {};
+-    return {ids.key(fields[1]), {time, static_cast<uint32_t>(price),
++    Person person;
++    {
++        SHOPPING_TIME(timing::Scope hash(timing::PersonHash, weight);)
++        person = ids.key(fields[1]);
++    }
++    return {person, {time, static_cast<uint32_t>(price),
+             purchase ? static_cast<Category>(catalogs.category(fields[5])) : 0}};
+ }
+ 
+@@ -970,12 +980,24 @@
+             people.emplace(links, ids);
+             return;
+         }
++        SHOPPING_TIME(timing::Scope scanning(timing::Scan);)
+         scan<7>(input.chunks[task - 1], [&](View, const Fields<7>& fields) {
++            SHOPPING_TIME(unsigned weight = timing::sample(256);)
+             if (fields[0].empty()) return;
+-            uint64_t id = event_ids.key(fields[0]);
+-            int64_t ingest = ingest_timestamp(fields[3]);
++            uint64_t id;
++            {
++                SHOPPING_TIME(timing::Scope hash(timing::Hash, weight);)
++                id = event_ids.key(fields[0]);
++            }
++            int64_t ingest;
++            {
++                SHOPPING_TIME(timing::Scope parse(timing::Parse, weight);)
++                ingest = ingest_timestamp(fields[3]);
++            }
+             // Keep invalid copies in the same competition for earliest ingest.
+-            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest);
++            auto event = parse_event<typename Candidate::Category>(fields, window, catalogs, ids, ingest
++                                                                  SHOPPING_TIME(, weight));
++            SHOPPING_TIME(timing::Scope route(timing::Route, weight);)
+             entries[worker]->append(id % event_buckets, id, ingest, event, window);
+         });
+     });
+@@ -1222,6 +1244,7 @@
+     size_t click = 0;
+     auto at = [&](size_t event) { return unpack(timelines.values[event], window); };
+     for (auto [person, event, end] : timelines.people) {
++        SHOPPING_TIME(unsigned weight = timing::sample(64);)
+         while (click < clicks.size() && clicks[click].person < person) ++click;
+         size_t begin = click;
+         while (click < clicks.size() && clicks[click].person == person) ++click;
+@@ -1247,6 +1270,7 @@
+                 ++daily.sessions;
+                 daily.revenue += revenue;
+ 
++                SHOPPING_TIME(timing::Scope attribution(timing::Attribution, weight);)
+                 const int64_t lower = start - week_ms;
+                 while (first < last && clicks[first].time < lower) {
+                     uint32_t campaign = clicks[first++].campaign;
+@@ -1345,6 +1369,7 @@
+ }
+ 
+ void write_campaigns(const fs::path& path, const CampaignTotals& totals, const Catalogs& catalogs) {
++    SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+     using parquet::little_endian;
+     using parquet::plain;
+     std::vector<std::pair<uint64_t, const CampaignDaily*>> rows;
+@@ -1422,14 +1447,22 @@
+     parallel(threads, partition_count, [&](unsigned worker, size_t task) {
+         size_t bucket = jobs[task];
+         if (!event_counts[bucket]) return;
+-        auto ev = collect_timelines(events, bucket, event_counts[bucket]);
+-        auto cl = collect_sorted(clicks, bucket, [](const Click& a, const Click& b) {
+-            if (a.person != b.person) return a.person < b.person;
+-            return a.time == b.time ? a.id > b.id : a.time < b.time;
+-        });
++        auto [ev, cl] = [&] {
++            SHOPPING_TIME(timing::Scope group(timing::Group);)
++            auto ev = collect_timelines(events, bucket, event_counts[bucket]);
++            auto cl = collect_sorted(clicks, bucket, [](const Click& a, const Click& b) {
++                if (a.person != b.person) return a.person < b.person;
++                return a.time == b.time ? a.id > b.id : a.time < b.time;
++            });
++            return std::pair(std::move(ev), std::move(cl));
++        }();
+         using Category = typename Candidate::Category;
+         std::vector<UserDaily<Category>> users;
+-        aggregate(ev, cl.view(), catalogs, window, campaign_totals[worker], users);
++        {
++            SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
++            aggregate(ev, cl.view(), catalogs, window, campaign_totals[worker], users);
++        }
++        SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+         auto& writer = writers[worker];
+         if (!writer) writer = std::make_unique<parquet::File>(out / "user_daily" /
+             ("part-" + std::to_string(worker) + ".parquet"), user_schema);
+@@ -1441,6 +1474,7 @@
+         writers[0] = std::make_unique<parquet::File>(out / "user_daily" / "part-0.parquet", user_schema);
+     parallel(threads, threads + 1, [&](unsigned, size_t task) {
+         if (task) {
++            SHOPPING_TIME(timing::Scope encode(timing::Encode);)
+             if (auto& file = writers[task - 1]) file->finish();
+             return;
+         }
+@@ -1449,6 +1483,7 @@
+         write_campaigns(out / "campaign_daily" / "part-0.parquet", totals, catalogs);
+     });
+     trace.mark("finish");
++    SHOPPING_TIME(timing::report();)
+     // Same code in the profiling and the final build: the profile writers are
+     // weak symbols that exist only when the binary is instrumented.
+     if (__gcov_dump) __gcov_dump();
+--- a/parquet.hpp
++++ b/parquet.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "detail_trace.hpp"
++
+ #include <algorithm>
+ #include <bit>
+ #include <cstdint>
+@@ -99,6 +101,7 @@
+     Bytes page_;
+ 
+     void write(const void* data, size_t size) {
++        SHOPPING_TIME(timing::Scope writing(timing::Write);)
+         if (size && std::fwrite(data, 1, size, file_) != size)
+             throw std::runtime_error("Parquet write failed");
+         offset_ += size;
+@@ -146,7 +149,9 @@
+ 
+ public:
+     File(const std::filesystem::path& path, std::span<const Column> schema)
+-        : file_(std::fopen(path.c_str(), "wb")), schema_(schema) {
++        : schema_(schema) {
++        SHOPPING_TIME(timing::Scope writing(timing::Write);)
++        file_ = std::fopen(path.c_str(), "wb");
+         if (!file_) throw std::runtime_error("cannot open " + path.string());
+         if (std::fwrite("PAR1", 1, 4, file_) != 4) {
+             std::fclose(file_);
+@@ -210,6 +215,7 @@
+         little_endian(footer, size);
+         write(footer);
+         write("PAR1", 4);
++        SHOPPING_TIME(timing::Scope close(timing::Write);)
+         int error = std::fclose(file_);
+         file_ = nullptr;
+         if (error) throw std::runtime_error("Parquet close failed");
