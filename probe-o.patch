@@ -1,0 +1,1279 @@
+diff --git a/candidate_staging.hpp b/candidate_staging.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e8b5d1bb9354df50138f5845d63170819c93112
+--- /dev/null
++++ b/candidate_staging.hpp
+@@ -0,0 +1,87 @@
++#pragma once
++
++struct PackedCandidate {
++    uint64_t id, person, value;
++};
++static_assert(sizeof(PackedCandidate) == 24);
++
++template<class Candidate, class Storage> struct CandidateCodec {
++    struct Escapes {};
++    CandidateCodec(size_t, const Window&) {}
++    Storage encode(const Candidate& row, Escapes&) const { return row; }
++    uint64_t key(const Storage& row) const { return row.id; }
++    int64_t ingest(const Storage& row) const { return row.ingest; }
++    const typename Candidate::Survivor& payload(const Storage& row) const { return row.payload; }
++    Candidate expand(const Storage& row, size_t) const { return row; }
++};
++
++template<> class CandidateCodec<CompactCandidate, PackedCandidate> {
++    static constexpr uint64_t no_purchase = uint64_t{1} << 63;
++    static constexpr uint64_t time_mask = 0x7fffffff00000000ULL;
++    static constexpr unsigned seconds_bits = 11;
++    static constexpr uint64_t seconds_mask = (1u << seconds_bits) - 1;
++    static constexpr int32_t unavailable = INT32_MIN;
++    uint64_t reclaim_mask_;
++    int64_t base_seconds_;
++
++    static const CompactCandidate& escaped(const PackedCandidate& row) {
++        return *reinterpret_cast<const CompactCandidate*>(uintptr_t(row.person));
++    }
++
++public:
++    using Escapes = std::deque<CompactCandidate>;
++
++    CandidateCodec(size_t buckets, const Window& window)
++        : reclaim_mask_(std::min<uint64_t>(buckets - 1, UINT16_MAX)), base_seconds_(window.start / 1000) {}
++
++    PackedCandidate encode(const CompactCandidate& row, Escapes& escapes) const {
++        const uint64_t key = row.id & ~reclaim_mask_;
++        const uint64_t value = row.payload.value;
++        const uint32_t price = uint32_t(value) & price_mask;
++        const uint32_t category = uint8_t(value >> 24);
++        const bool missing = row.ingest == bad_time;
++        const int64_t seconds = missing ? unavailable : row.ingest / 1000 - base_seconds_;
++        if (!(value & no_purchase) && (missing || row.ingest % 1000 == 0)) {
++            if (!price && !category && (missing || (seconds > unavailable && seconds <= INT32_MAX)))
++                return {key, row.payload.person, no_purchase | (value & time_mask) | uint32_t(seconds)};
++            if (price && price <= UINT16_MAX && category < 32 && !missing &&
++                uint64_t(seconds) <= ((reclaim_mask_ << seconds_bits) | seconds_mask)) {
++                uint64_t delta = seconds;
++                return {key | (delta >> seconds_bits), row.payload.person,
++                        (value & time_mask) | (delta & seconds_mask) << 21 | uint64_t(category) << 16 | price};
++            }
++        }
++        escapes.push_back(row);
++        return {key, reinterpret_cast<uintptr_t>(&escapes.back()), 0};
++    }
++
++    uint64_t key(const PackedCandidate& row) const { return row.id & ~reclaim_mask_; }
++
++    int64_t ingest(const PackedCandidate& row) const {
++        if (!row.value) return escaped(row).ingest;
++        int64_t seconds;
++        if (row.value & no_purchase) {
++            seconds = std::bit_cast<int32_t>(uint32_t(row.value));
++            if (seconds == unavailable) return bad_time;
++        } else {
++            seconds = ((row.id & reclaim_mask_) << seconds_bits) | ((row.value >> 21) & seconds_mask);
++        }
++        return (base_seconds_ + seconds) * 1000;
++    }
++
++    CompactEvent payload(const PackedCandidate& row) const {
++        if (!row.value) return escaped(row).payload;
++        uint64_t value = row.value & time_mask;
++        if (!(row.value & no_purchase))
++            value |= ((row.value >> 16) & 31) << 24 | uint16_t(row.value);
++        return {row.person, value};
++    }
++
++    CompactCandidate expand(const PackedCandidate& row, size_t bucket) const {
++        CompactCandidate result;
++        result.id = key(row) | (bucket & reclaim_mask_);
++        result.ingest = ingest(row);
++        result.payload = payload(row);
++        return result;
++    }
++};
+diff --git a/csv_index.hpp b/csv_index.hpp
+index e2a68f610fab67a81a513293133fdd6ed1a1f2af..ade49928aab6fe90dd685bb29f25056fbc488d12 100644
+--- a/csv_index.hpp
++++ b/csv_index.hpp
+@@ -103,6 +103,24 @@ private:
+         }
+     }
+ 
++    template<size_t N, bool QuoteFlags, class Row>
++    [[gnu::always_inline]] static inline void parse_row(const char* data, Row& row, const uint16_t*& field,
++                                                        const uint16_t*& error, unsigned begin, unsigned end) {
++        constexpr uint16_t position_mask = QuoteFlags ? csv_end_mask : UINT16_MAX;
++        if ((field[N - 1] & position_mask) == end && *error > end) {
++            if constexpr (QuoteFlags) {
++                if (has_quoted_field<N>(field)) row(IndexedCsvRow<CsvQuotes::Flagged>{data, field, begin});
++                else row(IndexedCsvRow<CsvQuotes::None>{data, field, begin});
++            } else {
++                row(IndexedCsvRow<CsvQuotes::Probe>{data, field, begin});
++            }
++            field += N;
++        } else {
++            while ((*field & position_mask) <= end) ++field;
++            while (*error <= end) ++error;
++        }
++    }
++
+ public:
+     template<size_t Ends, size_t Lines, bool QuoteFlags, bool ZeroCount>
+     [[gnu::always_inline]] void block(unsigned base, CsvMarkers marks) {
+@@ -123,28 +141,38 @@ public:
+         append(error_, base, bad);
+     }
+ 
+-    template<size_t N, bool QuoteFlags, class Row> void parse(const char* data, Row& row) {
+-        constexpr uint16_t position_mask = QuoteFlags ? csv_end_mask : UINT16_MAX;
++    template<size_t N, bool QuoteFlags, size_t Lanes, class Row> void parse(const char* data, Row& row) {
+         std::fill_n(end_, N, UINT16_MAX);
+         *error_ = UINT16_MAX;
+-        auto field = ends_;
+-        auto error = errors_;
+-        unsigned begin = 0;
+-        for (auto line = lines_; line != line_; ++line) {
+-            unsigned end = *line;
+-            if ((field[N - 1] & position_mask) == end && *error > end) {
+-                if constexpr (QuoteFlags) {
+-                    if (has_quoted_field<N>(field)) row(IndexedCsvRow<CsvQuotes::Flagged>{data, field, begin});
+-                    else row(IndexedCsvRow<CsvQuotes::None>{data, field, begin});
+-                } else {
+-                    row(IndexedCsvRow<CsvQuotes::Probe>{data, field, begin});
+-                }
+-                field += N;
+-            } else {
+-                while ((*field & position_mask) <= end) ++field;
+-                while (*error <= end) ++error;
++        struct Cursor { const uint16_t* line; const uint16_t* field; const uint16_t* error; unsigned begin; };
++        auto advance = [&](Cursor& cursor) __attribute__((always_inline)) {
++            unsigned end = *cursor.line++;
++            parse_row<N, QuoteFlags>(data, row, cursor.field, cursor.error, cursor.begin, end);
++            cursor.begin = end + 1;
++        };
++        if constexpr (Lanes == 1) {
++            Cursor cursor{lines_, ends_, errors_, 0};
++            while (cursor.line != line_) advance(cursor);
++        } else {
++            size_t rounds = (line_ - lines_) / Lanes;
++            std::array<Cursor, Lanes> lanes;
++            lanes[0] = {lines_, ends_, errors_, 0};
++            constexpr uint16_t position_mask = QuoteFlags ? csv_end_mask : UINT16_MAX;
++            for (size_t lane = 1; lane < Lanes; ++lane) {
++                auto* line = lines_ + lane * rounds;
++                unsigned begin = line == lines_ ? 0 : unsigned(line[-1]) + 1;
++                lanes[lane] = {line,
++                    std::lower_bound(ends_, end_, begin, [](uint16_t end, unsigned start) {
++                        return (end & position_mask) < start;
++                    }),
++                    std::lower_bound(errors_, error_, begin), begin};
++            }
++            for (size_t i = 0; i < rounds; ++i) {
++                [&]<size_t... I>(std::index_sequence<I...>) __attribute__((always_inline)) {
++                    (advance(lanes[I]), ...);
++                }(std::make_index_sequence<Lanes>{});
+             }
+-            begin = end + 1;
++            while (lanes.back().line != line_) advance(lanes.back());
+         }
+     }
+ };
+@@ -256,7 +284,7 @@ template<auto Mark, bool QuoteFlags> inline void csv_blocks(CsvIndex& index, Vie
+     run(index, input, size);
+ }
+ 
+-template<size_t N, auto Mark, bool QuoteFlags, class Row> void scan_indexed_impl(View chunk, Row& row) {
++template<size_t N, auto Mark, bool QuoteFlags, size_t Lanes, class Row> void scan_indexed_impl(View chunk, Row& row) {
+     while (!chunk.empty()) {
+         size_t size = std::min(chunk.size(), CsvIndex::batch_bytes);
+         while (size && chunk[size - 1] != '\n') --size;
+@@ -271,7 +299,7 @@ template<size_t N, auto Mark, bool QuoteFlags, class Row> void scan_indexed_impl
+                 SHOPPING_TIME(timing::Scope markers(timing::MarkerScan);)
+                 csv_blocks<Mark, QuoteFlags>(index, chunk, size);
+             }
+-            index.parse<N, QuoteFlags>(chunk.data(), row);
++            index.parse<N, QuoteFlags, Lanes>(chunk.data(), row);
+         }
+         chunk.remove_prefix(size);
+     }
+@@ -285,7 +313,7 @@ inline bool csv_quote_flags() {
+     return enabled;
+ }
+ 
+-template<size_t N, auto Mark, class Row> void scan_indexed(View chunk, Row row) {
+-    if (csv_quote_flags()) scan_indexed_impl<N, Mark, true>(chunk, row);
+-    else scan_indexed_impl<N, Mark, false>(chunk, row);
++template<size_t N, auto Mark, size_t Lanes = 1, class Row> void scan_indexed(View chunk, Row row) {
++    if (csv_quote_flags()) scan_indexed_impl<N, Mark, true, Lanes>(chunk, row);
++    else scan_indexed_impl<N, Mark, false, Lanes>(chunk, row);
+ }
+diff --git a/event_prefix.hpp b/event_prefix.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a402b82403c67c833d363b9bc1719068b081a837
+--- /dev/null
++++ b/event_prefix.hpp
+@@ -0,0 +1,79 @@
++#pragma once
++
++struct EventPrefix {
++    static constexpr size_t id_size = 9;
++    const char* event_id;
++    const char* user_id;
++    int64_t time, ingest;
++};
++
++using EventTemplateBytes = uint8_t __attribute__((vector_size(16)));
++
++template<const char (&Shape)[17]> bool event_template_matches(const char* text) {
++    constexpr auto pattern = [] {
++        struct Pattern { std::array<uint8_t, 16> base, limit; };
++        Pattern result{};
++        for (size_t i = 0; i < 16; ++i) {
++            bool digit = Shape[i] == '0', any = Shape[i] == '?';
++            result.base[i] = any ? 0 : Shape[i];
++            result.limit[i] = digit ? 9 : any ? 255 : 0;
++        }
++        return result;
++    }();
++    EventTemplateBytes bytes;
++    std::memcpy(&bytes, text, sizeof(bytes));
++    auto base = std::bit_cast<EventTemplateBytes>(pattern.base);
++    auto limit = std::bit_cast<EventTemplateBytes>(pattern.limit);
++    auto invalid = std::bit_cast<std::array<uint64_t, 2>>((bytes - base) > limit);
++    return (invalid[0] | invalid[1]) == 0;
++}
++
++inline constexpr char event_iso_template[] = "0000-00-00T00:00";
++inline constexpr char event_epoch_template[] = "0000000000000,??";
++
++int64_t event_template_iso(const char* text, bool offset) {
++    if (!event_template_matches<event_iso_template>(text) || text[16] != ':') return bad_time;
++    auto pair = [](const char* p) { return 10 * (p[0] - '0') + (p[1] - '0'); };
++    int h = pair(text + 11), m = pair(text + 14), s = two_digits(text + 17);
++    if (h > 23 || m > 59 || unsigned(s) > 59) return bad_time;
++    int zone = 0;
++    if (offset) {
++        zone = offset_seconds(text);
++        if (zone == bad_offset) return bad_time;
++    } else if (text[19] != 'Z') {
++        return bad_time;
++    }
++    int64_t midnight = calendar_midnight(pair(text) * 100 + pair(text + 2), pair(text + 5), pair(text + 8));
++    return midnight == bad_time ? bad_time : midnight + (h * 3600 + m * 60 + s - zone) * 1000;
++}
++
++template<CsvQuotes Quotes> bool read_event_prefix(const IndexedCsvRow<Quotes>& row, EventPrefix& prefix) {
++    const auto* ends = row.ends;
++    constexpr unsigned id_size = EventPrefix::id_size;
++    if (ends[0] != row.begin + id_size || ends[1] != row.begin + 2 * id_size + 1) return false;
++    unsigned ts_begin = row.begin + 2 * (id_size + 1);
++    unsigned ts_size = ends[2] - ts_begin;
++    if ((ts_size != 13 && ts_size != 20 && ts_size != 25) || ends[3] != ts_begin + ts_size + 21) return false;
++    if constexpr (Quotes != CsvQuotes::None) {
++        if (row.data[ends[3] + 1] == '"' || row.data[(ends[4] & csv_end_mask) + 1] == '"' ||
++            row.data[(ends[5] & csv_end_mask) + 1] == '"') return false;
++    }
++    const char* id = row.data + row.begin;
++    const char* user = id + id_size + 1;
++    if (id[0] != 'e' || user[0] != 'u') return false;
++    const char* ts = row.data + ts_begin;
++    int64_t time;
++    if (ts_size == 13) {
++        if (!event_template_matches<event_epoch_template>(ts)) return false;
++        time = epoch_millis_13<true>(ts);
++    } else {
++        time = event_template_iso(ts, ts_size == 25);
++        if (time == bad_time) return false;
++    }
++    int64_t ingest = event_template_iso(ts + ts_size + 1, false);
++    if (ingest == bad_time) return false;
++    prefix = {id, user, time, ingest};
++    return true;
++}
++
++inline bool read_event_prefix(const ScalarCsvRow<7>&, EventPrefix&) { return false; }
+diff --git a/main.cpp b/main.cpp
+index b689a6e1dfb2ca4b3f7a238f4d0a86c01f356cc0..fd9f9ec2f955d504821df339ca071b858af37b99 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -6,6 +6,7 @@
+ #include <charconv>
+ #include <chrono>
+ #include <cstdlib>
++#include <deque>
+ #include <exception>
+ #include <memory>
+ #include <mutex>
+@@ -453,12 +454,12 @@ template<size_t N, class Row> void scan_neon(View chunk, Row row) {
+ 
+ #include "csv_index.hpp"
+ 
+-template<size_t N, class Row> void scan_fields(View chunk, Row row) {
++template<size_t N, size_t Lanes = 1, class Row> void scan_fields(View chunk, Row row) {
+ #if defined(__x86_64__)
+-    if (scanner == Scanner::Avx512) return scan_indexed<N, csv_avx512>(chunk, row);
+-    if (scanner == Scanner::Avx2) return scan_indexed<N, csv_avx2>(chunk, row);
++    if (scanner == Scanner::Avx512) return scan_indexed<N, csv_avx512, Lanes>(chunk, row);
++    if (scanner == Scanner::Avx2) return scan_indexed<N, csv_avx2, Lanes>(chunk, row);
+ #elif defined(__aarch64__)
+-    if (scanner == Scanner::Neon) return scan_indexed<N, csv_neon>(chunk, row);
++    if (scanner == Scanner::Neon) return scan_indexed<N, csv_neon, Lanes>(chunk, row);
+ #endif
+     scan_scalar<N>(chunk, [&](View, const Fields<N>& fields) { row(ScalarCsvRow<N>{fields}); });
+ }
+@@ -513,19 +514,22 @@ constexpr auto years = [] {
+ constexpr int month_lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+ constexpr int month_offsets[] = {0,31,59,90,120,151,181,212,243,273,304,334};
+ 
+-int64_t calendar_midnight(const char* p) {
+-    if (p[4] != '-' || p[7] != '-' || p[10] != 'T') return bad_time;
+-    int century = two_digits(p), yr = two_digits(p + 2);
+-    int m = two_digits(p + 5), d = two_digits(p + 8);
+-    int y = century * 100 + yr;
+-    if ((century | yr) < 0 || y < 1 || m < 1 || m > 12 || d < 1) return bad_time;
++int64_t calendar_midnight(int y, int m, int d) {
++    if (y < 1 || m < 1 || m > 12 || d < 1) return bad_time;
+     auto [year_days, leap] = years[y];
+     if (d > month_lengths[m - 1] + (m == 2 && leap)) return bad_time;
+     int days = year_days + month_offsets[m - 1] + d - 1 + (m > 2 && leap);
+     return int64_t(days) * day_ms;
+ }
+ 
+-int64_t epoch_millis_13(const char* p) {
++int64_t calendar_midnight(const char* p) {
++    if (p[4] != '-' || p[7] != '-' || p[10] != 'T') return bad_time;
++    int century = two_digits(p), yr = two_digits(p + 2);
++    if ((century | yr) < 0) return bad_time;
++    return calendar_midnight(century * 100 + yr, two_digits(p + 5), two_digits(p + 8));
++}
++
++template<bool Validated = false> int64_t epoch_millis_13(const char* p) {
+     uint64_t first;
+     uint32_t next;
+     std::memcpy(&first, p, sizeof(first));
+@@ -533,8 +537,10 @@ int64_t epoch_millis_13(const char* p) {
+     unsigned last = uint8_t(p[12]) - unsigned('0');
+     first ^= 0x3030303030303030ULL;
+     next ^= 0x30303030U;
+-    if (((first | (first + 0x0606060606060606ULL) | next | (next + 0x06060606U)) &
+-         0xf0f0f0f0f0f0f0f0ULL) || last > 9) return bad_time;
++    if constexpr (!Validated) {
++        if (((first | (first + 0x0606060606060606ULL) | next | (next + 0x06060606U)) &
++             0xf0f0f0f0f0f0f0f0ULL) || last > 9) return bad_time;
++    }
+     auto four = [](uint64_t digits) {
+         uint64_t pairs = (digits * 10 + (digits >> 8)) & 0x00ff00ff00ff00ffULL;
+         return (pairs * 100 + (pairs >> 16)) & 0x0000ffff0000ffffULL;
+@@ -1409,7 +1415,7 @@ template<class Category> struct EventValue { int64_t time; uint32_t price; Categ
+ template<class Value> struct PersonEvent { Person person; Value value; };
+ template<class Category> using Event = PersonEvent<EventValue<Category>>;
+ using CompactEvent = PersonEvent<uint64_t>;
+-template<class Time> struct ClickValue { const char* id; Time time; uint32_t campaign; };
++template<class Time> struct ClickValue { const char* id; Time time; uint32_t campaign; bool long_id; };
+ template<class Time> using Click = PersonEvent<ClickValue<Time>>;
+ 
+ bool click_id_after(const char* a, const char* b) {
+@@ -1421,6 +1427,22 @@ bool click_id_after(const char* a, const char* b) {
+     }
+ }
+ 
++template<class Time> bool click_id_after(const ClickValue<Time>& a, const ClickValue<Time>& b, bool packed) {
++    if (packed && a.long_id && b.long_id) {
++        uint64_t left, right;
++        std::memcpy(&left, a.id, sizeof(left));
++        std::memcpy(&right, b.id, sizeof(right));
++        if (left != right) {
++            if constexpr (std::endian::native == std::endian::little)
++                return __builtin_bswap64(left) > __builtin_bswap64(right);
++            else
++                return left > right;
++        }
++        return click_id_after(a.id + sizeof(left), b.id + sizeof(right));
++    }
++    return click_id_after(a.id, b.id);
++}
++
+ constexpr uint32_t price_mask = (1u << 24) - 1;
+ 
+ bool compact_events(const Window& window, const Catalogs& catalogs) {
+@@ -1456,9 +1478,12 @@ template<class Index> struct WideCandidate {
+ 
+ };
+ 
++#include "candidate_staging.hpp"
+ #include "scatter.hpp"
+ #include "group_sort.hpp"
+ 
++template<> inline constexpr size_t scatter_block_groups<Click<uint32_t>> = 31;
++
+ EventValue<uint32_t> unpack(uint64_t value, const Window& window) {
+     return {window.start + int64_t(value >> 32), uint32_t(value) & price_mask, uint32_t(value) >> 24};
+ }
+@@ -1468,15 +1493,22 @@ template<class Category> EventValue<Category> unpack(EventValue<Category> value,
+ }
+ 
+ #include "session_buckets.hpp"
++#include "event_prefix.hpp"
+ 
+-template<class Candidate, class Row>
++template<class Candidate, class Row, class Prefix>
+ Event<typename Candidate::Category> parse_event(const Row& fields, const Window& window, const Catalogs& catalogs,
+-                                                Ids& ids, int64_t ingest SHOPPING_TIME(, unsigned weight)) {
++                                                Ids& ids, int64_t ingest, Prefix prefix SHOPPING_TIME(, unsigned weight)) {
+     using Category = typename Candidate::Category;
+     SHOPPING_TIME(timing::Scope validation(timing::Validate, weight);)
+     if (ingest == bad_time) return {};
+-    const char *user, *product, *type, *ts;
+-    size_t user_size = fields.template field<1>(user);
++    const char *user, *product, *type;
++    size_t user_size;
++    if constexpr (std::is_pointer_v<Prefix>) {
++        user = prefix->user_id;
++        user_size = EventPrefix::id_size;
++    } else {
++        user_size = fields.template field<1>(user);
++    }
+     if (!user_size) return {};
+     size_t product_size = fields.template field<5>(product);
+     if (!product_size) return {};
+@@ -1484,9 +1516,16 @@ Event<typename Candidate::Category> parse_event(const Row& fields, const Window&
+     bool purchase = type_size == 8 && std::memcmp(type, "purchase", 8) == 0;
+     if (!purchase && (type_size != 4 || (std::memcmp(type, "view", 4) && std::memcmp(type, "cart", 4))))
+         return {};
+-    size_t ts_size = fields.template field<2>(ts);
+     constexpr bool relative = std::is_same_v<Candidate, CompactCandidate>;
+-    int64_t time = window.event_time<relative>(View(ts, ts_size));
++    int64_t time;
++    if constexpr (std::is_pointer_v<Prefix>) {
++        time = prefix->time;
++        if constexpr (relative) time = std::bit_cast<int64_t>(uint64_t(time) - uint64_t(window.start));
++    } else {
++        const char* ts;
++        size_t ts_size = fields.template field<2>(ts);
++        time = window.event_time<relative>(View(ts, ts_size));
++    }
+     if constexpr (relative) {
+         if (uint64_t(time) >= uint64_t(window.end) - uint64_t(window.start) ||
+             time + window.start < ingest - day_ms) return {};
+@@ -1511,13 +1550,15 @@ Event<typename Candidate::Category> parse_event(const Row& fields, const Window&
+     return {person, {time, price, category}};
+ }
+ 
+-template<class Candidate, class ClickWork, class ClickFinish>
++template<class Candidate, class Storage, bool Dense, class ClickWork, class ClickFinish>
+ void read_events(const Input& input, unsigned threads, Trace& trace,
+                  const Window& window, const Catalogs& catalogs, const Input& links, Ids& ids,
+-                 People& people, ScatterWorkers<Candidate>& entries, size_t buckets, size_t ingest_buckets,
++                 People& people, ScatterWorkers<Storage, Dense>& entries, size_t buckets, size_t ingest_buckets,
+                  ScatterWorkers<typename Candidate::Survivor>& records, size_t partitions, size_t alias_batch,
+                  int alias_load, bool alias_bitmap, const ScatterSettings& scatter,
+-                 size_t click_tasks, ClickWork scan_clicks, ClickFinish finish_clicks) {
++                 unsigned row_lanes, bool row_template, size_t click_tasks, ClickWork scan_clicks, ClickFinish finish_clicks) {
++    CandidateCodec<Candidate, Storage> codec(ingest_buckets, window);
++    std::array<typename decltype(codec)::Escapes, 8> escapes;
+     std::optional<Ids> event_ids(std::in_place, 'e');
+     std::array<int64_t, 8> chunk_ends{};
+     LinkTrace link_trace;
+@@ -1527,10 +1568,16 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+     auto scan_events = [&](size_t worker, size_t task) {
+         ScatterRoute route(*entries[worker], scatter.prefetch);
+         SHOPPING_TIME(timing::Scope scanning(timing::Scan);)
+-        scan_fields<7>(input.chunks[task], [&](const auto& fields) {
++        auto parse = [&](const auto& fields, auto prefix) {
+             SHOPPING_TIME(unsigned weight = timing::sample(256);)
+             const char* event_id;
+-            size_t event_id_size = fields.template field<0>(event_id);
++            size_t event_id_size;
++            if constexpr (std::is_pointer_v<decltype(prefix)>) {
++                event_id = prefix->event_id;
++                event_id_size = EventPrefix::id_size;
++            } else {
++                event_id_size = fields.template field<0>(event_id);
++            }
+             if (!event_id_size) return;
+             uint64_t id;
+             {
+@@ -1540,14 +1587,33 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+             int64_t ingest;
+             {
+                 SHOPPING_TIME(timing::Scope parse(timing::Parse, weight);)
+-                const char* clock;
+-                size_t size = fields.template field<3>(clock);
+-                ingest = window.ingest_time(View(clock, size));
++                if constexpr (std::is_pointer_v<decltype(prefix)>) {
++                    ingest = prefix->ingest;
++                } else {
++                    const char* clock;
++                    size_t size = fields.template field<3>(clock);
++                    ingest = window.ingest_time(View(clock, size));
++                }
+             }
+-            auto event = parse_event<Candidate>(fields, window, catalogs, ids, ingest SHOPPING_TIME(, weight));
++            auto event = parse_event<Candidate>(fields, window, catalogs, ids, ingest, prefix SHOPPING_TIME(, weight));
+             SHOPPING_TIME(timing::Scope route(timing::Route, weight);)
+-            route.append(id & (ingest_buckets - 1), Candidate(id, ingest, event, window));
+-        });
++            route.append(id & (ingest_buckets - 1), codec.encode(Candidate(id, ingest, event, window), escapes[worker]));
++        };
++        auto scan_chunk = [&](auto row) {
++            auto chunk = input.chunks[task];
++            if (row_lanes == 2) scan_fields<7, 2>(chunk, row);
++            else if (row_lanes == 3) scan_fields<7, 3>(chunk, row);
++            else scan_fields<7>(chunk, row);
++        };
++        if (row_template && scanner != Scanner::Scalar) {
++            scan_chunk([&](const auto& fields) {
++                EventPrefix prefix;
++                if (read_event_prefix(fields, prefix)) parse(fields, &prefix);
++                else parse(fields, nullptr);
++            });
++        } else {
++            scan_chunk([&](const auto& fields) { parse(fields, nullptr); });
++        }
+         route.finish();
+         if (measure) chunk_ends[worker] = LinkTrace::now();
+     };
+@@ -1602,37 +1668,38 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+ 
+     struct Table {
+         std::vector<uint32_t> positions;
+-        std::vector<const Candidate*> winners;
++        std::vector<const Storage*> winners;
+     };
+     std::vector<Table> tables(threads);
+     const unsigned shift = std::countr_zero(buckets);
+     const bool high_tag = setting("SHOPPING_DEDUP_HIGH_TAG", true);
+-    auto dedup = [&](unsigned worker, size_t count, auto visit) {
++    auto dedup = [&](unsigned worker, size_t bucket, size_t count, auto visit) {
+         if (!count) return;
+         ScatterRoute routing(*records[worker], scatter.prefetch);
+         auto route = [&](const typename Candidate::Survivor& event) {
+             routing.append(event.person & (partitions - 1), event);
+         };
+         PersonBatch<typename Candidate::Survivor, decltype(route)> resolved(people, alias_batch, route);
+-        auto emit = [&](const Candidate& winner) {
+-            if (winner.payload.person) resolved.append(winner.payload);
++        auto emit = [&](const typename Candidate::Survivor& winner) {
++            if (winner.person) resolved.append(winner);
+         };
+         constexpr size_t budget = 512 << 10;
+-        constexpr size_t bytes_per_winner = std::bit_ceil(sizeof(Candidate)) + sizeof(const Candidate*);
++        constexpr size_t record_bytes = Dense ? sizeof(Storage) : std::bit_ceil(sizeof(Storage));
++        constexpr size_t bytes_per_winner = record_bytes + sizeof(const Storage*);
+         if (count > budget / bytes_per_winner ||
+             std::bit_ceil(count + count / 2 + 1) * sizeof(uint32_t) > budget - count * bytes_per_winner) {
+             auto order = [](const Candidate& a, const Candidate& b) {
+                 return a.id == b.id ? a.ingest < b.ingest : a.id < b.id;
+             };
+             SortedRuns<Candidate, decltype(order)> runs(order);
+-            visit([&](const auto& row) { runs.append(row); });
++            visit([&](const Storage& row) { runs.append(codec.expand(row, bucket)); });
+             runs.finish();
+             auto rows = runs.cursor();
+             uint64_t seen = 0;
+             while (!rows.empty()) {
+                 if (rows.front().id != seen) {
+                     seen = rows.front().id;
+-                    emit(rows.front());
++                    emit(rows.front().payload);
+                 }
+                 rows.pop();
+             }
+@@ -1649,17 +1716,18 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         size_t mask = slots - 1;
+         constexpr uint32_t index_mask = UINT16_MAX;
+         auto index_entries = [&]<bool HighTag> {
+-            visit([&](const Candidate& entry) {
+-                uint64_t hash = entry.id >> shift;
++            visit([&](const Storage& entry) {
++                uint64_t id = codec.key(entry);
++                uint64_t hash = id >> shift;
+                 uint32_t tag;
+-                if constexpr (HighTag) tag = uint32_t(entry.id >> 32) & ~index_mask;
++                if constexpr (HighTag) tag = uint32_t(id >> 32) & ~index_mask;
+                 else tag = uint32_t(hash ^ (hash >> 32)) & ~index_mask;
+                 size_t i = hash & mask;
+                 for (uint32_t pos; (pos = positions[i]); i = (i + 1) & mask) {
+                     if ((pos & ~index_mask) != tag) continue;
+                     auto*& winner = table.winners[(pos & index_mask) - 1];
+-                    if (winner->id != entry.id) continue;
+-                    if (entry.ingest < winner->ingest) winner = &entry;
++                    if (codec.key(*winner) != id) continue;
++                    if (codec.ingest(entry) < codec.ingest(*winner)) winner = &entry;
+                     return;
+                 }
+                 table.winners.push_back(&entry);
+@@ -1668,7 +1736,7 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         };
+         if (high_tag) index_entries.template operator()<true>();
+         else index_entries.template operator()<false>();
+-        for (auto* winner : table.winners) emit(*winner);
++        for (auto* winner : table.winners) emit(codec.payload(*winner));
+         resolved.finish();
+         routing.finish();
+     };
+@@ -1679,21 +1747,21 @@ void read_events(const Input& input, unsigned threads, Trace& trace,
+         size_t count = 0;
+         for (const auto& batch : entries) count += batch->size(bucket);
+         if (ingest_buckets == buckets) {
+-            dedup(worker, count, visit);
++            dedup(worker, bucket, count, visit);
+             return;
+         }
+         if (!count) return;
+         unsigned first_bits = std::countr_zero(ingest_buckets);
+         size_t parts = buckets / ingest_buckets;
+-        Scatter<const Candidate*> split(parts, scatter.huge, scatter.streaming,
+-                                        scatter.staging_bytes, scatter.avx, scatter.cursor);
++        Scatter<const Storage*> split(parts, scatter.huge, scatter.streaming,
++                                      scatter.staging_bytes, scatter.avx, scatter.cursor);
+         ScatterRoute route(split, scatter.prefetch);
+-        visit([&](const Candidate& row) { route.append((row.id >> first_bits) & (parts - 1), &row); });
++        visit([&](const Storage& row) { route.append((codec.key(row) >> first_bits) & (parts - 1), &row); });
+         route.finish();
+         split.finish();
+         for (size_t i = 0; i < parts; ++i) {
+-            dedup(worker, split.size(i), [&](auto consume) {
+-                split.visit(i, [&](const Candidate* row) { consume(*row); });
++            dedup(worker, bucket, split.size(i), [&](auto consume) {
++                split.visit(i, [&](const Storage* row) { consume(*row); });
+             });
+         }
+     }, [&](unsigned worker) { records[worker]->finish(); });
+@@ -1716,7 +1784,8 @@ void scan_click_chunk(View chunk, Scatter<Click<Time>>& records, size_t partitio
+     PersonBatch<Click<Time>, decltype(route)> resolved(people, alias_batch, route);
+     scan_fields<4>(chunk, [&](const auto& fields) {
+         const char* id;
+-        if (fields.template field<0>(id)) validate(id, fields, resolved);
++        size_t size = fields.template field<0>(id);
++        if (size) validate(id, size, fields, resolved);
+     });
+     resolved.finish();
+     routing.finish();
+@@ -1740,65 +1809,87 @@ struct PersonTableFull {};
+ 
+ template<class Value, class Time, class Index> struct Timelines {
+     using Category = decltype(unpack(std::declval<Value>(), std::declval<const Window&>()).category);
++    using Purchase = SessionPurchase<Category>;
+     struct PersonRange { Person person; Index begin, end, click_begin, click_end; };
+     struct Slot { Person person; Index index, count; };
+-    std::vector<PersonRange> people;
++    std::span<PersonRange> people;
++    std::vector<PersonRange> person_vector;
++    ScratchArray<PersonRange> person_storage;
+     ScratchArray<Value> values, staged;
+     ScratchArray<ClickValue<Time>> clicks;
+     ScratchArray<Index> local_ids, click_ids;
+     ScratchArray<uint64_t> keys, by_bucket;
+-    memory::Vector<SessionPurchase<Category>> purchases;
++    std::span<Purchase> purchases;
++    memory::Vector<Purchase> purchase_vector;
++    ScratchArray<Purchase> purchase_storage;
+     std::vector<Index> bucket_offsets;
+     std::vector<Index> event_offsets;
+     memory::Vector<Slot> table;
+ };
+ 
+-template<bool Bucketed, class Value, class Time, class Index>
++template<bool Bucketed, bool Fast, class Value, class Time, class Index>
+ void collect_timelines(Timelines<Value, Time, Index>& result,
+                        const ScatterWorkers<PersonEvent<Value>>& sources,
+                        const ScatterWorkers<Click<Time>>& click_sources,
+                        size_t bucket, size_t total, size_t click_count, unsigned partition_bits,
+                        const Window& window, const BucketLayout& layout, size_t few_clicks,
+                        bool larger_person_table) {
+-    auto& people = result.people;
+     auto& table = result.table;
+     auto& offsets = result.event_offsets;
+-    people.clear();
++    using PersonRange = typename Timelines<Value, Time, Index>::PersonRange;
++    using Purchase = typename Timelines<Value, Time, Index>::Purchase;
++    auto& person_vector = result.person_vector;
++    person_vector.clear();
+     offsets.clear();
+     using Slot = typename Timelines<Value, Time, Index>::Slot;
+     size_t max_people = Bucketed ? std::min(total, layout.person_limit()) : 768;
+-    size_t max_slots = std::max<size_t>(32, std::bit_ceil((max_people * 4 + 2) / 3));
+-    size_t estimate = larger_person_table ? total / 8 : total / 16;
++    bool low_load = Fast && larger_person_table;
++    size_t max_slots = std::max<size_t>(32, std::bit_ceil(low_load ? max_people * 2 : (max_people * 4 + 2) / 3));
++    size_t estimate = total / (larger_person_table ? (Fast ? 4 : 8) : 16);
+     size_t table_size = std::clamp<size_t>(std::bit_ceil(estimate + 1), 32, max_slots);
+     table.assign(table_size, Slot{});
+-    auto find = [partition_bits](auto& slots, Person person) -> Slot& {
+-        size_t mask = slots.size() - 1;
++    auto* slots = table.data();
++    size_t mask = table_size - 1;
++    auto find = [partition_bits](Slot* slots, size_t mask, Person person) -> Slot& {
+         size_t i = (person >> partition_bits) & mask;
+         while (slots[i].person && slots[i].person != person) i = (i + 1) & mask;
+         return slots[i];
+     };
++    PersonRange* person_storage = Fast ? result.person_storage.resize(max_people) : nullptr;
++    size_t person_count = 0;
++    size_t grow_at = low_load ? table_size / 2 : table_size * 3 / 4;
+     auto add = [&](Person person) -> Slot& {
+-        auto* slot = &find(table, person);
++        auto* slot = &find(slots, mask, person);
+         if (slot->person) return *slot;
+-        if (people.size() == max_people) throw PersonTableFull{};
+-        if (people.size() == table.size() * 3 / 4) {
++        if (person_count == max_people) throw PersonTableFull{};
++        if (person_count == grow_at) {
+             memory::Vector<Slot> grown(table.size() * 2);
+-            for (auto entry : table) if (entry.person) find(grown, entry.person) = entry;
++            for (auto entry : table) if (entry.person) find(grown.data(), grown.size() - 1, entry.person) = entry;
+             table.swap(grown);
+-            slot = &find(table, person);
++            slots = table.data();
++            mask = table.size() - 1;
++            grow_at *= 2;
++            slot = &find(slots, mask, person);
+         }
+-        *slot = {person, static_cast<Index>(people.size()), 0};
+-        people.push_back({person, 0, 0, 0, 0});
++        *slot = {person, static_cast<Index>(person_count), 0};
++        PersonRange range{person, 0, 0, 0, 0};
++        if constexpr (Fast) person_storage[person_count] = range;
++        else person_vector.push_back(range);
++        ++person_count;
+         return *slot;
+     };
+ 
+     auto* local_ids = Bucketed ? nullptr : result.local_ids.resize(total);
+     auto* staged = Bucketed ? nullptr : result.staged.resize(total);
+     auto* keys = Bucketed ? result.keys.resize(total) : nullptr;
++    Purchase* purchase_storage = nullptr;
++    size_t purchase_count = 0;
+     if constexpr (Bucketed) {
+         result.bucket_offsets.assign(layout.count, 0);
+-        result.purchases.clear();
++        if constexpr (Fast) purchase_storage = result.purchase_storage.resize(total);
++        else result.purchase_vector.clear();
+     }
++    auto* bucket_offsets = result.bucket_offsets.data();
+     size_t row_index = 0;
+     for (const auto& batch : sources) batch->visit(bucket, [&](const auto& row) {
+         auto& slot = add(row.person);
+@@ -1809,28 +1900,33 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+             if constexpr (std::is_same_v<Value, uint64_t>) time = row.value >> 32;
+             else time = uint64_t(event.time) - uint64_t(window.start);
+             uint32_t time_bucket = time / gap_ms;
+-            ++result.bucket_offsets[time_bucket];
++            ++bucket_offsets[time_bucket];
+             keys[row_index++] = layout.key(slot.index, time_bucket, time);
+-            if (event.price) result.purchases.push_back({(uint64_t(slot.index) << 32) | time,
+-                                                        event.price, event.category});
++            if (event.price) {
++                Purchase purchase{(uint64_t(slot.index) << 32) | time, event.price, event.category};
++                if constexpr (Fast) purchase_storage[purchase_count++] = purchase;
++                else result.purchase_vector.push_back(purchase);
++            }
+         } else {
+             staged[row_index] = row.value;
+             local_ids[row_index++] = slot.index;
+         }
+     });
+-    offsets.resize(people.size());
++    auto people = std::span(Fast ? person_storage : person_vector.data(), person_count);
++    result.people = people;
++    offsets.resize(person_count);
+     for (auto slot : table) if (slot.person) offsets[slot.index] = slot.count;
+     auto* click_ids = result.click_ids.resize(click_count);
+     constexpr Index absent = std::numeric_limits<Index>::max();
+     row_index = 0;
+     for (const auto& batch : click_sources) batch->visit(bucket, [&](const auto& row) {
+-        auto& slot = find(table, row.person);
++        auto& slot = find(slots, mask, row.person);
+         click_ids[row_index++] = slot.person ? slot.index : absent;
+         if (slot.person) ++people[slot.index].click_end;
+     });
+ 
+     size_t next = 0, next_click = 0;
+-    for (size_t i = 0; i < people.size(); ++i) {
++    for (size_t i = 0; i < person_count; ++i) {
+         auto& range = people[i];
+         range.begin = next;
+         next += offsets[i];
+@@ -1842,6 +1938,8 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+     }
+     if constexpr (Bucketed) {
+         bucket_scatter(layout, keys, result.by_bucket.resize(total), total, result.bucket_offsets, offsets);
++        if constexpr (Fast) result.purchases = std::span(purchase_storage, purchase_count);
++        else result.purchases = result.purchase_vector;
+         std::sort(result.purchases.begin(), result.purchases.end(),
+                   [](const auto& a, const auto& b) { return a.key < b.key; });
+     } else {
+@@ -1859,7 +1957,7 @@ void collect_timelines(Timelines<Value, Time, Index>& result,
+         if (range.click_end - range.click_begin > std::max<size_t>(1, few_clicks))
+             std::sort(clicks + range.click_begin, clicks + range.click_end,
+                       [](const auto& a, const auto& b) {
+-                          return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
++                          return a.time == b.time ? click_id_after(a, b, Fast) : a.time < b.time;
+                       });
+     }
+ }
+@@ -1923,9 +2021,11 @@ template<class Category> struct AttributionScratch {
+     std::vector<Category> bought;
+     std::vector<size_t> counts;
+     std::vector<uint32_t> positions, active;
++    bool packed_clicks;
+ 
+-    explicit AttributionScratch(const Catalogs& catalogs)
+-        : counts(catalogs.campaigns.size()), positions(counts.size()) {
++    AttributionScratch(const Catalogs& catalogs, bool packed)
++        : bought(catalogs.categories.size()), counts(catalogs.campaigns.size()), positions(counts.size()),
++          active(counts.size()), packed_clicks(packed) {
+         if constexpr (!sparse_categories) spend.resize(catalogs.categories.size());
+     }
+ };
+@@ -1935,19 +2035,25 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+                       const Catalogs& catalogs, const Window& window, CampaignTotals& totals,
+                       UserOutput<Category>& users, AttributionScratch<Category>& scratch) {
+     constexpr bool sparse_categories = AttributionScratch<Category>::sparse_categories;
+-    auto& [spend, bought, counts, positions, active] = scratch;
+     using Time = decltype(last.front().time);
++    auto& spend = scratch.spend;
++    auto* const bought = scratch.bought.data();
++    auto* const counts = scratch.counts.data();
++    auto* const positions = scratch.positions.data();
++    auto* const active = scratch.active.data();
++    auto* active_end = active;
+     SHOPPING_TIME(unsigned weight = timing::sample(64);)
+     uint32_t latest = 0;
+     do {
+         int32_t day = utc_day(sessions.start());
+         UserDaily<Category> daily{person, day, no_category<Category>};
+         auto* day_campaigns = totals.day(day);
++        auto* bought_end = bought;
+         do {
+             int64_t start = sessions.start(), revenue = 0;
+             daily.events += sessions.take([&](uint32_t price, Category category) {
+                 auto& category_spend = spend[category];
+-                if (!category_spend) bought.push_back(category);
++                if (!category_spend) *bought_end++ = category;
+                 category_spend += price;
+                 revenue += price;
+             });
+@@ -1958,31 +2064,27 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+             const int64_t click_start = std::is_unsigned_v<Time> ? start - (window.start - week_ms) : start;
+             uint32_t winner = 0;
+             if constexpr (Few) {
+-                const char* best_id = nullptr;
+-                int64_t best_time = INT64_MIN;
++                const ClickValue<Time>* best = nullptr;
+                 for (auto click = first; !click.empty(); click.pop()) {
+                     const auto& row = click.front();
+                     if (uint64_t(click_start) - uint64_t(row.time) > week_ms) continue;
+                     if (!counts[row.campaign]) {
+-                        active.push_back(row.campaign);
++                        *active_end++ = row.campaign;
+                         counts[row.campaign] = 1;
+                     }
+-                    if (row.time > best_time || (row.time == best_time && (!best_id || click_id_after(best_id, row.id)))) {
+-                        best_time = row.time;
+-                        best_id = row.id;
+-                        winner = row.campaign;
+-                    }
++                    if (!best || row.time > best->time ||
++                        (row.time == best->time && click_id_after(*best, row, scratch.packed_clicks))) best = &row;
+                 }
++                if (best) winner = best->campaign;
+             } else {
+                 const int64_t lower = click_start - week_ms;
+                 while (first.position() != last.position() && first.front().time < lower) {
+                     uint32_t campaign = first.front().campaign;
+                     first.pop();
+                     if (--counts[campaign] == 0) {
+-                        uint32_t tail = active.back();
++                        uint32_t tail = *--active_end;
+                         active[positions[campaign]] = tail;
+                         positions[tail] = positions[campaign];
+-                        active.pop_back();
+                     }
+                 }
+                 while (!last.empty() && last.front().time <= click_start) {
+@@ -1994,8 +2096,8 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+                     }
+                     uint32_t campaign = latest = row.campaign;
+                     if (counts[campaign]++ == 0) {
+-                        positions[campaign] = active.size();
+-                        active.push_back(campaign);
++                        positions[campaign] = active_end - active;
++                        *active_end++ = campaign;
+                     }
+                 }
+                 winner = first.position() != last.position() ? latest : 0;
+@@ -2004,16 +2106,18 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+             ++credit.sessions;
+             credit.purchases += revenue != 0;
+             credit.revenue += revenue;
+-            for (uint32_t campaign : active) {
++            for (auto* it = active; it != active_end; ++it) {
++                uint32_t campaign = *it;
+                 if (day_campaigns) ++day_campaigns[campaign].assists;
+                 else ++totals[campaign_key(day, campaign)].assists;
+                 if constexpr (Few) counts[campaign] = 0;
+             }
+-            if constexpr (Few) active.clear();
++            if constexpr (Few) active_end = active;
+         } while (!sessions.empty() && utc_day(sessions.start()) == day);
+ 
+         int64_t high = 0;
+-        for (Category category : bought) {
++        for (auto* it = bought; it != bought_end; ++it) {
++            Category category = *it;
+             int64_t revenue = spend[category];
+             if (revenue > high || (revenue == high &&
+                 catalogs.categories[category] < catalogs.categories[daily.category])) {
+@@ -2023,11 +2127,9 @@ void aggregate_person(Person person, Sessions sessions, ClickCursor first, Click
+             if constexpr (sparse_categories) spend.erase(category);
+             else spend[category] = 0;
+         }
+-        bought.clear();
+         users.append(daily);
+     } while (!sessions.empty());
+-    for (uint32_t campaign : active) counts[campaign] = 0;
+-    active.clear();
++    for (auto* it = active; it != active_end; ++it) counts[*it] = 0;
+ }
+ 
+ template<bool Bucketed, class Value, class Time, class Index, class Category>
+@@ -2069,8 +2171,8 @@ void aggregate_runs(const ScatterWorkers<PersonEvent<Value>>& sources, const Sca
+     }
+     if (!votes) frequent = 0;
+     auto event_value_less = [](const auto& a, const auto& b) { return time_key(a) < time_key(b); };
+-    auto click_value_less = [](const auto& a, const auto& b) {
+-        return a.time == b.time ? click_id_after(a.id, b.id) : a.time < b.time;
++    auto click_value_less = [packed = scratch.packed_clicks](const auto& a, const auto& b) {
++        return a.time == b.time ? click_id_after(a, b, packed) : a.time < b.time;
+     };
+     auto event_less = [&](const auto& a, const auto& b) {
+         return a.person == b.person ? event_value_less(a.value, b.value) : a.person < b.person;
+@@ -2283,6 +2385,11 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto alias_load = number_env("SHOPPING_ALIAS_LOAD", 50);
+     if (alias_load != 50 && alias_load != 75) throw std::runtime_error("invalid SHOPPING_ALIAS_LOAD");
+     bool alias_bitmap = setting("SHOPPING_ALIAS_BITMAP", false);
++    auto row_lanes = number_env("SHOPPING_ROW_LANES", 1);
++    if (row_lanes > 3) throw std::runtime_error("invalid SHOPPING_ROW_LANES");
++    bool row_template = setting("SHOPPING_ROW_TEMPLATE", false);
++    auto record_bytes = number_env("SHOPPING_RECORD_BYTES", 32);
++    if (record_bytes != 24 && record_bytes != 32) throw std::runtime_error("invalid SHOPPING_RECORD_BYTES");
+     auto staging_lines = number_env("SHOPPING_STAGING_LINES", 1);
+     if (staging_lines != 1 && staging_lines != 2 && staging_lines != 4)
+         throw std::runtime_error("invalid SHOPPING_STAGING_LINES");
+@@ -2298,11 +2405,10 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+                             std::min<uint64_t>(max_staging_prefetch, number_env("SHOPPING_STAGING_PREFETCH", 0, 0)),
+                             staging_avx, setting("SHOPPING_STAGING_CURSOR", true)};
+     size_t ingest_buckets = setting("SHOPPING_EVENT_TWO_LEVEL", false) ? std::min<size_t>(64, buckets) : buckets;
+-    auto entries = scatter_workers<Candidate>(threads, ingest_buckets, scatter);
+     auto events = scatter_workers<Survivor>(threads, partitions, scatter);
+     using ClickTime = std::conditional_t<std::is_same_v<Candidate, CompactCandidate>, uint32_t, int64_t>;
+     ScatterWorkers<Click<ClickTime>> clicks;
+-    auto validate_click = [&](const char* id, const auto& f, auto& batch) {
++    auto validate_click = [&](const char* id, size_t id_size, const auto& f, auto& batch) {
+         const char *user, *ts, *campaign_id;
+         size_t user_size = f.template field<1>(user);
+         if (!user_size) return;
+@@ -2319,7 +2425,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+         uint32_t campaign = catalogs.campaign(View(campaign_id, campaign_size));
+         if (!campaign) return;
+         Person person = ids.key(View(user, user_size));
+-        batch.append({person, {id, static_cast<ClickTime>(time), campaign}});
++        batch.append({person, {id, static_cast<ClickTime>(time), campaign, id_size >= sizeof(uint64_t)}});
+     };
+     auto scan_clicks = [&](unsigned worker, size_t task) {
+         scan_click_chunk(click_input.chunks[task], *clicks[worker], partitions, people,
+@@ -2328,9 +2434,19 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto finish_clicks = [&](unsigned worker) { clicks[worker]->finish(); };
+     bool click_ingest = setting("SHOPPING_CLICK_INGEST", true);
+     if (click_ingest) clicks = scatter_workers<Click<ClickTime>>(threads, partitions, scatter);
+-    read_events(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets, ingest_buckets,
+-                events, partitions, alias_batch, alias_load, alias_bitmap, scatter,
+-                click_ingest ? click_input.chunks.size() : 0, scan_clicks, finish_clicks);
++    auto ingest_events = [&]<class Storage>() {
++        auto entries = scatter_workers<Storage, std::is_same_v<Storage, PackedCandidate>>(threads, ingest_buckets, scatter);
++        read_events<Candidate>(event_input, threads, trace, window, catalogs, links, ids, people, entries, buckets,
++                               ingest_buckets, events, partitions, alias_batch, alias_load, alias_bitmap, scatter,
++                               row_lanes, row_template, click_ingest ? click_input.chunks.size() : 0,
++                               scan_clicks, finish_clicks);
++    };
++    if constexpr (std::is_same_v<Candidate, CompactCandidate>) {
++        if (record_bytes == 24) ingest_events.template operator()<PackedCandidate>();
++        else ingest_events.template operator()<Candidate>();
++    } else {
++        ingest_events.template operator()<Candidate>();
++    }
+     if (trace.enabled()) std::fprintf(stderr, "partitions %zu %zu\n", buckets, partitions);
+     if (!click_ingest) {
+         clicks = scatter_workers<Click<ClickTime>>(threads, partitions, scatter);
+@@ -2347,7 +2463,8 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto layout = BucketLayout::for_span(uint64_t(window.end) - uint64_t(window.start));
+     size_t bucket_minimum = number_env("SHOPPING_BUCKET_MIN_EVENTS", 128);
+     size_t few_clicks = number_env("SHOPPING_FEW_CLICKS", 16, 0);
+-    bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", false);
++    bool session_fast = setting("SHOPPING_SESSION_FAST", false);
++    bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", session_fast);
+     bool bucket_sessions = layout.count && !setting("SHOPPING_FORCE_SORT", false);
+     auto partition_bits = std::countr_zero(partitions);
+     struct Worker {
+@@ -2357,15 +2474,16 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+         UserOutput<Category> users;
+         GroupTrace group;
+ 
+-        Worker(const Window& window, const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows)
+-            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs),
++        Worker(const Window& window, const Catalogs& catalogs, const Ids& ids, fs::path path, size_t group_rows,
++               bool session_fast)
++            : campaigns(window, catalogs.campaigns.size()), attribution(catalogs, session_fast),
+               users(catalogs, ids, std::move(path), group_rows) {}
+     };
+     std::vector<Worker> workers;
+     workers.reserve(threads);
+     for (unsigned i = 0; i < threads; ++i)
+         workers.emplace_back(window, catalogs, ids, out / "user_daily" / ("part-" + std::to_string(i) + ".parquet"),
+-                             user_group_rows);
++                             user_group_rows, session_fast);
+     std::vector<size_t> jobs(partitions), event_counts(partitions), click_counts(partitions);
+     for (size_t bucket = 0; bucket < partitions; ++bucket) {
+         jobs[bucket] = bucket;
+@@ -2383,8 +2501,12 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+             {
+                 GroupTrace::Scope measured{group};
+                 SHOPPING_TIME(timing::Scope group(timing::Group);)
+-                collect_timelines<Bucketed>(state.timelines, events, clicks, bucket, count, click_count,
+-                                            partition_bits, window, layout, few_clicks, larger_person_table);
++                if (session_fast)
++                    collect_timelines<Bucketed, true>(state.timelines, events, clicks, bucket, count, click_count,
++                                                      partition_bits, window, layout, few_clicks, larger_person_table);
++                else
++                    collect_timelines<Bucketed, false>(state.timelines, events, clicks, bucket, count, click_count,
++                                                       partition_bits, window, layout, few_clicks, larger_person_table);
+             }
+             SHOPPING_TIME(timing::Scope sessions(timing::Sessions);)
+             aggregate<Bucketed>(state.timelines, catalogs, window, state.campaigns, state.users, state.attribution,
+diff --git a/scatter.hpp b/scatter.hpp
+index f4e166e169c6b75ed6648c469e58fee4f8e8199f..2f03ad3150ece5990a3d2c6ea5d79e370ad19fbb 100644
+--- a/scatter.hpp
++++ b/scatter.hpp
+@@ -106,19 +106,23 @@ inline bool scatter_avx_supported() {
+ }
+ #endif
+ 
+-template<class T> class Scatter {
++template<class T> inline constexpr size_t scatter_block_groups = sizeof(T) == 16 ? 63 : sizeof(T) == 24 ? 31 : 127;
++
++template<class T, bool Dense = false> class Scatter {
+     static constexpr size_t line = 64;
+     static_assert(sizeof(T) <= line && alignof(T) <= line);
+     static_assert(std::is_trivially_copyable_v<T>);
+-    static constexpr size_t staging_rows = line / sizeof(T);
+-    static constexpr size_t block_lines = sizeof(T) == 16 ? 63 : sizeof(T) == 24 ? 31 : 127;
++    static_assert(!Dense || sizeof(T) == 24);
++    static constexpr size_t group_bytes = Dense ? 3 * line : line;
++    static constexpr size_t staging_rows = group_bytes / sizeof(T);
++    static constexpr size_t block_groups = Dense ? 21 : scatter_block_groups<T>;
+     struct alignas(line) Buffer { T rows[staging_rows]; };
+     struct alignas(line) Block {
+         Block* next;
+         size_t used;
+-        Buffer lines[block_lines];
++        Buffer groups[block_groups];
+     };
+-    static_assert(sizeof(Block) == line * (block_lines + 1));
++    static_assert(sizeof(Block) == line + group_bytes * block_groups);
+     struct alignas(32) Stream {
+         Block* head = nullptr;
+         Block* tail = nullptr;
+@@ -161,22 +165,22 @@ template<class T> class Scatter {
+         if (stream.used >= block_rows_ || (!Cursor && !stream.tail)) advance(stream);
+     }
+ 
+-    template<bool Cursor> void write_line(Stream& stream, std::byte* source) {
++    template<bool Cursor> void write_group(Stream& stream, std::byte* source) {
+         ensure_space<Cursor>(stream);
+-        auto* destination = stream.tail->lines + stream.used / staging_rows;
++        auto* destination = stream.tail->groups + stream.used / staging_rows;
+ #if defined(__x86_64__)
+         if (streaming_) {
+-            if constexpr (staging_rows * sizeof(T) < line)
+-                std::memset(source + staging_rows * sizeof(T), 0, line - staging_rows * sizeof(T));
++            if constexpr (staging_rows * sizeof(T) < group_bytes)
++                std::memset(source + staging_rows * sizeof(T), 0, group_bytes - staging_rows * sizeof(T));
+ #if defined(__AVX2__)
+             auto* to = reinterpret_cast<__m256i*>(destination);
+             auto* from = reinterpret_cast<const __m256i*>(source);
+-            _mm256_stream_si256(to, _mm256_load_si256(from));
+-            _mm256_stream_si256(to + 1, _mm256_load_si256(from + 1));
++            for (size_t i = 0; i < group_bytes / 32; ++i)
++                _mm256_stream_si256(to + i, _mm256_load_si256(from + i));
+ #else
+             auto* to = reinterpret_cast<__m128i*>(destination);
+             auto* from = reinterpret_cast<const __m128i*>(source);
+-            for (size_t i = 0; i < line / 16; ++i)
++            for (size_t i = 0; i < group_bytes / 16; ++i)
+                 _mm_stream_si128(to + i, _mm_load_si128(from + i));
+ #endif
+         } else
+@@ -186,18 +190,18 @@ template<class T> class Scatter {
+     }
+ 
+     template<bool Cursor> void flush(Stream& stream, uintptr_t start) {
+-        if (staging_bytes_ == line) {
+-            write_line<Cursor>(stream, reinterpret_cast<std::byte*>(start));
++        if (staging_bytes_ == group_bytes) {
++            write_group<Cursor>(stream, reinterpret_cast<std::byte*>(start));
+             return;
+         }
+         ensure_space<Cursor>(stream);
+-        auto* destination = stream.tail->lines + stream.used / staging_rows;
++        auto* destination = stream.tail->groups + stream.used / staging_rows;
+         auto* source = reinterpret_cast<std::byte*>(start);
+ #if defined(__x86_64__)
+         if (streaming_) {
+-            if constexpr (staging_rows * sizeof(T) < line)
+-                for (size_t i = 0; i < staging_bytes_; i += line)
+-                    std::memset(source + i + staging_rows * sizeof(T), 0, line - staging_rows * sizeof(T));
++            if constexpr (staging_rows * sizeof(T) < group_bytes)
++                for (size_t i = 0; i < staging_bytes_; i += group_bytes)
++                    std::memset(source + i + staging_rows * sizeof(T), 0, group_bytes - staging_rows * sizeof(T));
+             if (staging_bytes_ == 128 && avx_) {
+                 stream_128(destination, source);
+             } else {
+@@ -208,9 +212,9 @@ template<class T> class Scatter {
+             }
+         } else
+ #endif
+-            for (size_t i = 0; i < staging_bytes_ / line; ++i)
+-                std::memcpy(destination[i].rows, source + i * line, staging_rows * sizeof(T));
+-        stream.used += (staging_bytes_ / line) * staging_rows;
++            for (size_t i = 0; i < staging_bytes_ / group_bytes; ++i)
++                std::memcpy(destination[i].rows, source + i * group_bytes, staging_rows * sizeof(T));
++        stream.used += (staging_bytes_ / group_bytes) * staging_rows;
+     }
+ 
+ public:
+@@ -218,9 +222,9 @@ public:
+         : streams_(partitions),
+           cursors_(use_cursor ? std::make_unique_for_overwrite<Cursors[]>(
+               (partitions + cursors_per_line - 1) / cursors_per_line) : nullptr),
+-          buffers_(std::aligned_alloc(staging_bytes, partitions * staging_bytes), &std::free),
+-          arena_(huge), staging_bytes_(staging_bytes),
+-          block_rows_((block_lines & ~(staging_bytes / line - 1)) * staging_rows),
++          buffers_(std::aligned_alloc(staging_bytes, partitions * staging_bytes * (group_bytes / line)), &std::free),
++          arena_(huge), staging_bytes_(staging_bytes * (group_bytes / line)),
++          block_rows_((block_groups & ~(staging_bytes / line - 1)) * staging_rows),
+           staging_capacity_(staging_bytes / line * staging_rows),
+           streaming_(streaming), avx_(avx) {
+         if (!buffers_) throw std::bad_alloc();
+@@ -241,17 +245,17 @@ public:
+     void append(size_t index, const T& row) {
+         if (!cursors_) {
+             auto& stream = streams_[index];
+-            if (staging_bytes_ == line) {
++            if (staging_bytes_ == group_bytes) {
+                 auto* start = reinterpret_cast<std::byte*>(buffer(index));
+                 std::memcpy(start + stream.pending++ * sizeof(T), &row, sizeof(T));
+                 if (stream.pending == staging_rows) {
+-                    write_line<false>(stream, start);
++                    write_group<false>(stream, start);
+                     stream.pending = 0;
+                 }
+             } else {
+                 auto start = buffer(index);
+                 auto pending = stream.pending++;
+-                auto offset = pending / staging_rows * line + pending % staging_rows * sizeof(T);
++                auto offset = pending / staging_rows * group_bytes + pending % staging_rows * sizeof(T);
+                 std::memcpy(reinterpret_cast<void*>(start + offset), &row, sizeof(T));
+                 if (stream.pending == staging_capacity_) {
+                     flush<false>(stream, start);
+@@ -263,11 +267,14 @@ public:
+         auto& write = cursor(index);
+         uintptr_t next = write + sizeof(T);
+         std::memcpy(reinterpret_cast<void*>(write), &row, sizeof(T));
+-        if constexpr (line % sizeof(T) != 0) {
++        if constexpr (!Dense && line % sizeof(T) != 0) {
+             if ((next & (line - 1)) + sizeof(T) > line)
+                 next = (next + line - 1) & ~(line - 1);
+         }
+-        if (!(next & (staging_bytes_ - 1))) {
++        bool full;
++        if constexpr (Dense) full = next == buffer(index) + staging_bytes_;
++        else full = !(next & (staging_bytes_ - 1));
++        if (full) {
+             next -= staging_bytes_;
+             flush<true>(streams_[index], next);
+         }
+@@ -279,12 +286,12 @@ public:
+             auto& stream = streams_[i];
+             auto start = buffer(i);
+             size_t bytes = cursors_ ? cursor(i) - start
+-                : stream.pending / staging_rows * line + stream.pending % staging_rows * sizeof(T);
++                : stream.pending / staging_rows * group_bytes + stream.pending % staging_rows * sizeof(T);
+             if (bytes) {
+                 if (!stream.tail || stream.used >= block_rows_) advance(stream);
+-                auto* destination = stream.tail->lines + stream.used / staging_rows;
+-                for (size_t offset = 0; offset < bytes; offset += line) {
+-                    size_t count = std::min(bytes - offset, line) / sizeof(T);
++                auto* destination = stream.tail->groups + stream.used / staging_rows;
++                for (size_t offset = 0; offset < bytes; offset += group_bytes) {
++                    size_t count = std::min(bytes - offset, group_bytes) / sizeof(T);
+                     std::memcpy(destination->rows, reinterpret_cast<void*>(start + offset), count * sizeof(T));
+                     ++destination;
+                     stream.used += count;
+@@ -306,23 +313,23 @@ public:
+     void take_mappings(std::vector<memory::Region>& regions) { arena_.take_mappings(regions); }
+     const T* first(size_t index) const {
+         auto* block = streams_[index].head;
+-        return block ? block->lines[0].rows : nullptr;
++        return block ? block->groups[0].rows : nullptr;
+     }
+ 
+     template<class Visit> void visit(size_t index, Visit visit) const {
+         for (auto* block = streams_[index].head; block; block = block->next) {
+             if (block->next) __builtin_prefetch(block->next);
+             for (size_t i = 0; i < block->used; ++i)
+-                visit(block->lines[i / staging_rows].rows[i % staging_rows]);
++                visit(block->groups[i / staging_rows].rows[i % staging_rows]);
+         }
+     }
+ };
+ 
+ constexpr size_t max_staging_prefetch = 64;
+ 
+-template<class T> class ScatterRoute {
++template<class T, bool Dense> class ScatterRoute {
+     struct Entry { size_t partition; T row; };
+-    Scatter<T>& scatter_;
++    Scatter<T, Dense>& scatter_;
+     size_t depth_;
+     std::array<Entry, max_staging_prefetch> pending_;
+     size_t first_ = 0, next_ = 0;
+@@ -333,7 +340,7 @@ template<class T> class ScatterRoute {
+     }
+ 
+ public:
+-    ScatterRoute(Scatter<T>& scatter, size_t depth) : scatter_(scatter), depth_(depth) {}
++    ScatterRoute(Scatter<T, Dense>& scatter, size_t depth) : scatter_(scatter), depth_(depth) {}
+ 
+     void append(size_t partition, const T& row) {
+         if (!depth_) {
+@@ -350,12 +357,13 @@ public:
+ 
+ struct ScatterSettings { bool huge, streaming; size_t staging_bytes, prefetch; bool avx, cursor; };
+ 
+-template<class T> using ScatterWorkers = std::vector<std::unique_ptr<Scatter<T>>>;
++template<class T, bool Dense = false> using ScatterWorkers = std::vector<std::unique_ptr<Scatter<T, Dense>>>;
+ 
+-template<class T> ScatterWorkers<T> scatter_workers(unsigned threads, size_t partitions, const ScatterSettings& settings) {
+-    ScatterWorkers<T> workers;
++template<class T, bool Dense = false>
++ScatterWorkers<T, Dense> scatter_workers(unsigned threads, size_t partitions, const ScatterSettings& settings) {
++    ScatterWorkers<T, Dense> workers;
+     for (unsigned i = 0; i < threads; ++i)
+-        workers.push_back(std::make_unique<Scatter<T>>(partitions, settings.huge, settings.streaming,
+-                                                       settings.staging_bytes, settings.avx, settings.cursor));
++        workers.push_back(std::make_unique<Scatter<T, Dense>>(partitions, settings.huge, settings.streaming,
++                                                              settings.staging_bytes, settings.avx, settings.cursor));
+     return workers;
+ }

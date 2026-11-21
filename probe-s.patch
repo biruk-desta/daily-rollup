@@ -1,0 +1,44 @@
+diff --git a/csv_index.hpp b/csv_index.hpp
+index e2a68f610fab67a81a513293133fdd6ed1a1f2af..b5f8ef2f79f1f5ed86610d5c64fcbd73d356b8bc 100644
+--- a/csv_index.hpp
++++ b/csv_index.hpp
+@@ -237,7 +237,7 @@ inline bool csv_zero_count() {
+     if (!__get_cpuid_count(7, 0, &a, &b, &c, &d) || !(b & bit_BMI)) return false;
+ #endif
+     const char* value = std::getenv("SHOPPING_CSV_TZCNT");
+-    return value && std::strcmp(value, "1") == 0;
++    return !value || std::strcmp(value, "1") == 0;
+ }
+ 
+ template<auto Mark, bool QuoteFlags, bool ZeroCount> auto csv_block_runner(const char* setting) {
+diff --git a/main.cpp b/main.cpp
+index b689a6e1dfb2ca4b3f7a238f4d0a86c01f356cc0..98bfd92e2b0a31361267de17a3f0cabe1e50c2ab 100644
+--- a/main.cpp
++++ b/main.cpp
+@@ -1144,7 +1144,7 @@ public:
+     static bool direct_lookup() {
+         static const bool direct = [] {
+             const char* value = std::getenv("SHOPPING_ALIAS_DIRECT_PROBE");
+-            return value && std::strcmp(value, "1") == 0;
++            return !value || std::strcmp(value, "1") == 0;
+         }();
+         return direct;
+     }
+@@ -2286,7 +2286,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto staging_lines = number_env("SHOPPING_STAGING_LINES", 1);
+     if (staging_lines != 1 && staging_lines != 2 && staging_lines != 4)
+         throw std::runtime_error("invalid SHOPPING_STAGING_LINES");
+-    auto staging_bytes = number_env("SHOPPING_STAGING_BYTES", 0, 0);
++    auto staging_bytes = number_env("SHOPPING_STAGING_BYTES", 128, 0);
+     if (staging_bytes && staging_bytes != 64 && staging_bytes != 128)
+         throw std::runtime_error("invalid SHOPPING_STAGING_BYTES");
+     bool staging_avx = false;
+@@ -2347,7 +2347,7 @@ void process(const Window& window, const Input& links, const Catalogs& catalogs,
+     auto layout = BucketLayout::for_span(uint64_t(window.end) - uint64_t(window.start));
+     size_t bucket_minimum = number_env("SHOPPING_BUCKET_MIN_EVENTS", 128);
+     size_t few_clicks = number_env("SHOPPING_FEW_CLICKS", 16, 0);
+-    bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", false);
++    bool larger_person_table = setting("SHOPPING_PERSON_TABLE_DOUBLE", true);
+     bool bucket_sessions = layout.count && !setting("SHOPPING_FORCE_SORT", false);
+     auto partition_bits = std::countr_zero(partitions);
+     struct Worker {
